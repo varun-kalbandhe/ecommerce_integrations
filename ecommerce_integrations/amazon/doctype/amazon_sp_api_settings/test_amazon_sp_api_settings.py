@@ -214,12 +214,9 @@ class TestAmazonSettings:
 			return item_group_name
 
 		self.is_active = 1
-		self.iam_arn = "********************"
 		self.refresh_token = "********************"
 		self.client_id = "********************"
 		self.client_secret = "********************"
-		self.aws_access_key = "********************"
-		self.aws_secret_key = "********************"
 		self.country = "US"
 		self.company = get_company()
 		self.warehouse = get_warehouse()
@@ -243,12 +240,9 @@ class TestAmazonRepository(AmazonRepository):
 	def __init__(self) -> None:
 		self.amz_setting = TestAmazonSettings()
 		self.instance_params = dict(
-			iam_arn=self.amz_setting.iam_arn,
 			client_id=self.amz_setting.client_id,
 			client_secret=self.amz_setting.client_secret,
 			refresh_token=self.amz_setting.refresh_token,
-			aws_access_key=self.amz_setting.aws_access_key,
-			aws_secret_key=self.amz_setting.aws_secret_key,
 			country_code=self.amz_setting.country,
 		)
 
@@ -285,12 +279,9 @@ class TestAmazon(unittest.TestCase):
 
 	def test_validate_credentials(self):
 		credentials = dict(
-			iam_arn="********************",
 			client_id="********************",
 			client_secret="********************",
 			refresh_token="********************",
-			aws_access_key="********************",
-			aws_secret_key="********************",
 			country="US",
 		)
 
