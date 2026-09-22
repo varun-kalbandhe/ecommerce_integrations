@@ -172,6 +172,47 @@
 			]
 		}
 	},
+	"get_listings_item_200": {
+		"status": 200,
+		"json": {
+			"sku": "100343",
+			"summaries": [
+				{
+					"marketplaceId": "A21TJRUUN4KGV",
+					"asin": "B0GYSTCR27",
+					"productType": "MASSAGER",
+					"status": [
+						"DISCOVERABLE",
+						"BUYABLE"
+					]
+				}
+			],
+			"attributes": {
+				"external_product_information": [
+					{
+						"entity": "HSN Code",
+						"value": "30049099",
+						"marketplace_id": "A21TJRUUN4KGV"
+					}
+				]
+			}
+		}
+	},
+	"get_my_fees_estimate_for_asin_200": {
+		"status": 200,
+		"json": {
+			"payload": {
+				"FeesEstimateResult": {
+					"FeesEstimateIdentifier": {
+						"MarketplaceId": "A21TJRUUN4KGV",
+						"IdType": "ASIN",
+						"SellerId": "AH7IT8SP3TEJ5",
+						"IdValue": "B0GYSTCR27"
+					}
+				}
+			}
+		}
+	},
 	"list_financial_events_by_order_id_200": {
 		"status": 200,
 		"json": {

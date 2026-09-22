@@ -14,7 +14,9 @@ from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api 
 	SPAPI,
 	CatalogItems,
 	Finances,
+	ListingsItems,
 	Orders,
+	ProductFees,
 	SPAPIError,
 )
 from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api_settings import (
@@ -170,6 +172,8 @@ class AmazonRepository:
 					new_item_group = frappe.new_doc("Item Group")
 					new_item_group.item_group_name = item_group_name
 					new_item_group.parent_item_group = self.amz_setting.parent_item_group
+					if frappe.db.has_column("Item Group", "custom_description"):
+						new_item_group.custom_description = item_group_name
 					if frappe.db.has_column("Item Group", "gst_hsn_code"):
 						parent_hsn = frappe.db.get_value(
 							"Item Group", self.amz_setting.parent_item_group, "gst_hsn_code"
@@ -283,6 +287,12 @@ class AmazonRepository:
 		item.item_group = create_item_group(amazon_item)
 		item.brand = create_brand(amazon_item)
 		item.manufacturer = create_manufacturer(amazon_item)
+
+		if frappe.db.has_column("Item", "gst_hsn_code"):
+			amazon_hsn = self.get_amazon_hsn(order_item)
+			if amazon_hsn:
+				item.gst_hsn_code = amazon_hsn
+
 		item.insert(ignore_permissions=True)
 
 		create_item_price(amazon_item, item.item_code)
@@ -528,6 +538,80 @@ class AmazonRepository:
 
 	def get_catalog_items_instance(self) -> CatalogItems:
 		return CatalogItems(**self.instance_params)
+
+	def get_listings_items_instance(self) -> ListingsItems:
+		return ListingsItems(**self.instance_params)
+
+	def get_product_fees_instance(self) -> ProductFees:
+		return ProductFees(**self.instance_params)
+
+	def get_seller_id(self, asin: str | None = None) -> str | None:
+		if getattr(self, "_seller_id", None):
+			return self._seller_id
+
+		if getattr(self.amz_setting, "seller_id", None):
+			self._seller_id = self.amz_setting.seller_id
+			return self._seller_id
+
+		cached = frappe.cache.hget("amazon_sp_api_seller_id", self.amz_setting.name)
+		if cached:
+			self._seller_id = cached
+			return self._seller_id
+
+		if asin:
+			try:
+				product_fees = self.get_product_fees_instance()
+				resp = product_fees.get_my_fees_estimate_for_asin(asin)
+				seller_id = (
+					resp.get("payload", {})
+					.get("FeesEstimateResult", {})
+					.get("FeesEstimateIdentifier", {})
+					.get("SellerId")
+				)
+				if seller_id:
+					self._seller_id = seller_id
+					frappe.cache.hset("amazon_sp_api_seller_id", self.amz_setting.name, seller_id)
+					return self._seller_id
+			except Exception as e:
+				frappe.log_error(message=str(e), title="Failed to resolve Amazon Seller ID")
+
+		return None
+
+	def get_amazon_hsn(self, order_item) -> str | None:
+		seller_sku = order_item.get("SellerSKU")
+		if not seller_sku:
+			return None
+
+		seller_id = self.get_seller_id(asin=order_item.get("ASIN"))
+		if not seller_id:
+			return None
+
+		try:
+			listings_client = self.get_listings_items_instance()
+			listing = listings_client.get_listings_item(
+				seller_id=seller_id,
+				sku=seller_sku,
+			)
+			if not isinstance(listing, dict) or "errors" in listing:
+				return None
+
+			attributes = listing.get("attributes") or {}
+			ext_info = attributes.get("external_product_information") or []
+			if isinstance(ext_info, list):
+				for entry in ext_info:
+					if isinstance(entry, dict):
+						entity = entry.get("entity")
+						if entity in ("HSN Code", "HSN"):
+							val = entry.get("value")
+							if val:
+								return str(val).strip()
+		except Exception as e:
+			frappe.log_error(
+				message=str(e),
+				title=f'Listings Items API failed to retrieve HSN for SKU "{seller_sku}"',
+			)
+
+		return None
 
 
 def validate_amazon_sp_api_credentials(**args) -> None:

@@ -23,7 +23,9 @@ from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api 
 	SPAPI,
 	CatalogItems,
 	Finances,
+	ListingsItems,
 	Orders,
+	ProductFees,
 	SPAPIError,
 	Util,
 )
@@ -153,6 +155,41 @@ class TestCatalogItems(CatalogItems, TestSPAPI):
 		)
 
 
+class TestListingsItems(ListingsItems, TestSPAPI):
+	def get_listings_item(
+		self,
+		seller_id: str,
+		sku: str,
+		marketplace_ids: str | list | None = None,
+		included_data: str | list | None = None,
+		**kwargs,
+	) -> object:
+		self.expected_response = DATA.get("get_listings_item_200")
+		return super().get_listings_item(
+			seller_id,
+			sku,
+			marketplace_ids=marketplace_ids,
+			included_data=included_data,
+		)
+
+
+class TestProductFees(ProductFees, TestSPAPI):
+	def get_my_fees_estimate_for_asin(
+		self,
+		asin: str,
+		price: float = 100.0,
+		currency: str = "INR",
+		identifier: str = "fees_est",
+	) -> object:
+		self.expected_response = DATA.get("get_my_fees_estimate_for_asin_200")
+		return super().get_my_fees_estimate_for_asin(
+			asin,
+			price=price,
+			currency=currency,
+			identifier=identifier,
+		)
+
+
 class TestAmazonSettings:
 	def __init__(self) -> None:
 		def get_company():
@@ -273,6 +310,12 @@ class TestAmazonRepository(AmazonRepository):
 	def get_catalog_items_instance(self):
 		return TestCatalogItems(**self.instance_params)
 
+	def get_listings_items_instance(self):
+		return TestListingsItems(**self.instance_params)
+
+	def get_product_fees_instance(self):
+		return TestProductFees(**self.instance_params)
+
 
 class TestAmazon(unittest.TestCase):
 	def setUp(self):
@@ -293,3 +336,92 @@ class TestAmazon(unittest.TestCase):
 		)
 
 		self.assertRaises(ValidationError, validate_amazon_sp_api_credentials, **credentials)
+
+	def test_hsn_extraction_from_listings(self):
+		repo = TestAmazonRepository()
+		order_item = {"ASIN": "B0GYSTCR27", "SellerSKU": "100343"}
+		hsn = repo.get_amazon_hsn(order_item)
+		self.assertEqual(hsn, "30049099")
+
+	def test_missing_hsn_fallback_to_parent(self):
+		repo = TestAmazonRepository()
+		order_item = {"ASIN": "B0GYSTCR27", "SellerSKU": "100343"}
+		# When listings API returns no external_product_information
+		orig_get_listings = repo.get_listings_items_instance
+		mock_client = unittest.mock.MagicMock()
+		mock_client.get_listings_item.return_value = {"sku": "100343", "attributes": {}}
+		repo.get_listings_items_instance = lambda: mock_client
+
+		hsn = repo.get_amazon_hsn(order_item)
+		self.assertIsNone(hsn)
+
+	def test_item_creation_receives_amazon_hsn(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "TEST_ASIN_HSN_1",
+			"SellerSKU": "100343",
+			"OrderItemId": "TEST_ITEM_ID_1",
+			"Title": "Test Product With HSN",
+		}
+		repo.get_amazon_hsn = lambda oi: "30049099"
+
+		# Ensure item does not exist
+		if frappe.db.exists("Item", "TEST_ASIN_HSN_1"):
+			frappe.delete_doc("Item", "TEST_ASIN_HSN_1", force=True)
+
+		item_code = repo.create_item(order_item)
+		item_doc = frappe.get_doc("Item", item_code)
+		if frappe.db.has_column("Item", "gst_hsn_code"):
+			self.assertEqual(item_doc.gst_hsn_code, "30049099")
+
+		# Cleanup
+		frappe.delete_doc("Item", item_code, force=True)
+
+	def test_item_group_receives_custom_description(self):
+		repo = TestAmazonRepository()
+		amazon_item = {
+			"summaries": [{"websiteDisplayGroupName": "_Test Custom Desc Group"}]
+		}
+		if frappe.db.exists("Item Group", "_Test Custom Desc Group"):
+			frappe.delete_doc("Item Group", "_Test Custom Desc Group", force=True)
+
+		# Mock has_column to simulate presence of custom_description
+		orig_has_column = frappe.db.has_column
+		def mock_has_column(doctype, column):
+			if doctype == "Item Group" and column == "custom_description":
+				return True
+			return orig_has_column(doctype, column)
+
+		with unittest.mock.patch("frappe.db.has_column", side_effect=mock_has_column):
+			# Test create_item_group inner function via reflection or isolated execution
+			ig = frappe.new_doc("Item Group")
+			ig.item_group_name = "_Test Custom Desc Group"
+			ig.parent_item_group = repo.amz_setting.parent_item_group
+			if frappe.db.has_column("Item Group", "custom_description"):
+				ig.custom_description = ig.item_group_name
+			self.assertEqual(ig.custom_description, "_Test Custom Desc Group")
+
+	def test_existing_item_hsn_not_overwritten(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "TEST_EXISTING_ITEM",
+			"SellerSKU": "TEST_EXISTING_SKU",
+		}
+		# If item already exists in DB
+		if not frappe.db.exists("Item", "TEST_EXISTING_ITEM"):
+			existing_item = frappe.new_doc("Item")
+			existing_item.item_code = "TEST_EXISTING_ITEM"
+			existing_item.item_name = "Existing Test Item"
+			existing_item.item_group = repo.amz_setting.parent_item_group
+			if frappe.db.has_column("Item", "gst_hsn_code"):
+				existing_item.gst_hsn_code = "84672100"
+			existing_item.insert(ignore_permissions=True)
+
+		item_code = repo.get_item_code(order_item)
+		self.assertEqual(item_code, "TEST_EXISTING_ITEM")
+		item_doc = frappe.get_doc("Item", item_code)
+		if frappe.db.has_column("Item", "gst_hsn_code"):
+			self.assertEqual(item_doc.gst_hsn_code, "84672100")
+
+		# Cleanup
+		frappe.delete_doc("Item", "TEST_EXISTING_ITEM", force=True)

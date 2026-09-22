@@ -9,6 +9,8 @@ __all__ = [
 	"Finances",
 	"Orders",
 	"CatalogItems",
+	"ListingsItems",
+	"ProductFees",
 ]
 
 
@@ -117,12 +119,16 @@ class SPAPI:
 
 		url = self.endpoint + self.BASE_URI + append_to_base_uri
 
+		headers = self.get_headers()
+		if data and isinstance(data, str) and "content-type" not in [k.lower() for k in headers.keys()]:
+			headers["content-type"] = "application/json"
+
 		response = request(
 			method=method,
 			url=url,
 			params=params,
 			data=data,
-			headers=self.get_headers(),
+			headers=headers,
 		)
 		return response.json()
 
@@ -234,6 +240,65 @@ class CatalogItems(SPAPI):
 		data = dict(marketplaceIds=marketplace_ids, includedData=included_data)
 
 		return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
+
+
+class ListingsItems(SPAPI):
+	"""Amazon Listings Items API"""
+
+	BASE_URI = "/listings/2021-08-01"
+
+	def get_listings_item(
+		self,
+		seller_id: str,
+		sku: str,
+		marketplace_ids: str | list | None = None,
+		included_data: str | list | None = None,
+	) -> dict:
+		"""Returns details about a listing item for a seller."""
+		if not marketplace_ids:
+			marketplace_ids = self.marketplace_id
+
+		if isinstance(marketplace_ids, list):
+			marketplace_ids = ",".join(marketplace_ids)
+
+		if not included_data:
+			included_data = "attributes"
+		elif isinstance(included_data, list):
+			included_data = ",".join(included_data)
+
+		append_to_base_uri = f"/items/{seller_id}/{sku}"
+		params = dict(marketplaceIds=marketplace_ids, includedData=included_data)
+
+		return self.make_request(append_to_base_uri=append_to_base_uri, params=params)
+
+
+class ProductFees(SPAPI):
+	"""Amazon Product Fees API"""
+
+	BASE_URI = "/products/fees/v0"
+
+	def get_my_fees_estimate_for_asin(
+		self,
+		asin: str,
+		price: float = 100.0,
+		currency: str = "INR",
+		identifier: str = "fees_est",
+	) -> dict:
+		import json
+
+		body = {
+			"FeesEstimateRequest": {
+				"MarketplaceId": self.marketplace_id,
+				"PriceToEstimateFees": {
+					"ListingPrice": {"CurrencyCode": currency, "Amount": price}
+				},
+				"Identifier": identifier,
+			}
+		}
+		append_to_base_uri = f"/items/{asin}/feesEstimate"
+		return self.make_request(
+			method="POST", append_to_base_uri=append_to_base_uri, data=json.dumps(body)
+		)
 
 
 class Util:
