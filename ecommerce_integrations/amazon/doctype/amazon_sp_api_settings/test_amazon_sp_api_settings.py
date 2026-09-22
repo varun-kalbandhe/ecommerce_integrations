@@ -360,7 +360,7 @@ class TestAmazon(unittest.TestCase):
 		repo = TestAmazonRepository()
 		order_item = {
 			"ASIN": "TEST_ASIN_HSN_1",
-			"SellerSKU": "100343",
+			"SellerSKU": "TEST_SKU_HSN_1",
 			"OrderItemId": "TEST_ITEM_ID_1",
 			"Title": "Test Product With HSN",
 		}
@@ -369,6 +369,8 @@ class TestAmazon(unittest.TestCase):
 		# Ensure item does not exist
 		if frappe.db.exists("Item", "TEST_ASIN_HSN_1"):
 			frappe.delete_doc("Item", "TEST_ASIN_HSN_1", force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_ASIN_HSN_1"})
+		frappe.db.delete("Ecommerce Item", {"sku": "TEST_SKU_HSN_1"})
 
 		item_code = repo.create_item(order_item)
 		item_doc = frappe.get_doc("Item", item_code)
@@ -377,6 +379,8 @@ class TestAmazon(unittest.TestCase):
 
 		# Cleanup
 		frappe.delete_doc("Item", item_code, force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_ASIN_HSN_1"})
+		frappe.db.delete("Ecommerce Item", {"sku": "TEST_SKU_HSN_1"})
 
 	def test_item_group_receives_custom_description(self):
 		repo = TestAmazonRepository()
@@ -440,6 +444,7 @@ class TestAmazon(unittest.TestCase):
 
 		if frappe.db.exists("Item", "TEST_ASIN_UOM_1"):
 			frappe.delete_doc("Item", "TEST_ASIN_UOM_1", force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_ASIN_UOM_1"})
 
 		item_code = repo.create_item(order_item)
 		item_doc = frappe.get_doc("Item", item_code)
@@ -451,6 +456,7 @@ class TestAmazon(unittest.TestCase):
 
 		# Cleanup
 		frappe.delete_doc("Item", item_code, force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_ASIN_UOM_1"})
 
 	def test_order_items_preparation_has_uom(self):
 		repo = TestAmazonRepository()
@@ -460,3 +466,106 @@ class TestAmazon(unittest.TestCase):
 		self.assertEqual(first_item.get("uom"), "Nos")
 		self.assertEqual(first_item.get("stock_uom"), "Nos")
 		self.assertEqual(first_item.get("conversion_factor"), 1)
+
+	def test_item_creation_falls_back_to_item_group_hsn(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "TEST_FALLBACK_HSN",
+			"SellerSKU": "TEST_FALLBACK_SKU",
+			"OrderItemId": "TEST_FALLBACK_ID",
+			"Title": "Test Product Fallback HSN",
+		}
+		repo.get_amazon_hsn = lambda oi: None
+
+		if frappe.db.exists("Item", "TEST_FALLBACK_HSN"):
+			frappe.delete_doc("Item", "TEST_FALLBACK_HSN", force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_FALLBACK_HSN"})
+
+		parent_group = repo.amz_setting.parent_item_group
+		orig_hsn = frappe.db.get_value("Item Group", parent_group, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+		try:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", "420211")
+				if frappe.db.exists("Item Group", "Health and Beauty"):
+					frappe.delete_doc("Item Group", "Health and Beauty", force=True)
+
+			item_code = repo.create_item(order_item)
+			item_doc = frappe.get_doc("Item", item_code)
+			if frappe.db.has_column("Item", "gst_hsn_code"):
+				self.assertEqual(item_doc.gst_hsn_code, "420211")
+		finally:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", orig_hsn)
+			if frappe.db.exists("Item", "TEST_FALLBACK_HSN"):
+				frappe.delete_doc("Item", "TEST_FALLBACK_HSN", force=True)
+			frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_FALLBACK_HSN"})
+
+	def test_amazon_hsn_takes_precedence_over_item_group_hsn(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "TEST_PRECEDENCE_HSN",
+			"SellerSKU": "TEST_PRECEDENCE_SKU",
+			"OrderItemId": "TEST_PRECEDENCE_ID",
+			"Title": "Test Product Precedence HSN",
+		}
+		repo.get_amazon_hsn = lambda oi: "30049099"
+
+		if frappe.db.exists("Item", "TEST_PRECEDENCE_HSN"):
+			frappe.delete_doc("Item", "TEST_PRECEDENCE_HSN", force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_PRECEDENCE_HSN"})
+
+		parent_group = repo.amz_setting.parent_item_group
+		orig_hsn = frappe.db.get_value("Item Group", parent_group, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+		try:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", "420211")
+				if frappe.db.exists("Item Group", "Health and Beauty"):
+					frappe.delete_doc("Item Group", "Health and Beauty", force=True)
+
+			item_code = repo.create_item(order_item)
+			item_doc = frappe.get_doc("Item", item_code)
+			if frappe.db.has_column("Item", "gst_hsn_code"):
+				self.assertEqual(item_doc.gst_hsn_code, "30049099")
+		finally:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", orig_hsn)
+			if frappe.db.exists("Item", "TEST_PRECEDENCE_HSN"):
+				frappe.delete_doc("Item", "TEST_PRECEDENCE_HSN", force=True)
+			frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_PRECEDENCE_HSN"})
+
+	def test_item_creation_without_any_hsn_raises_mandatory_error(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "TEST_NO_HSN",
+			"SellerSKU": "TEST_NO_HSN_SKU",
+			"OrderItemId": "TEST_NO_HSN_ID",
+			"Title": "Test Product No HSN",
+		}
+		repo.get_amazon_hsn = lambda oi: None
+
+		if frappe.db.exists("Item", "TEST_NO_HSN"):
+			frappe.delete_doc("Item", "TEST_NO_HSN", force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_NO_HSN"})
+
+		parent_group = repo.amz_setting.parent_item_group
+		orig_hsn = frappe.db.get_value("Item Group", parent_group, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+		try:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", None)
+				if frappe.db.exists("Item Group", "Health and Beauty"):
+					frappe.delete_doc("Item Group", "Health and Beauty", force=True)
+
+			if frappe.db.get_single_value("GST Settings", "validate_hsn_code"):
+				with self.assertRaises(frappe.MandatoryError):
+					repo.create_item(order_item)
+			else:
+				item_code = repo.create_item(order_item)
+				item_doc = frappe.get_doc("Item", item_code)
+				self.assertIsNone(item_doc.gst_hsn_code)
+				frappe.delete_doc("Item", item_code, force=True)
+		finally:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", orig_hsn)
+			if frappe.db.exists("Item", "TEST_NO_HSN"):
+				frappe.delete_doc("Item", "TEST_NO_HSN", force=True)
+			frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_NO_HSN"})

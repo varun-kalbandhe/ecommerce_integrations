@@ -293,6 +293,14 @@ class AmazonRepository:
 			amazon_hsn = self.get_amazon_hsn(order_item)
 			if amazon_hsn:
 				item.gst_hsn_code = amazon_hsn
+			elif frappe.db.has_column("Item Group", "gst_hsn_code"):
+				group_hsn = frappe.db.get_value(
+					"Item Group",
+					item.item_group,
+					"gst_hsn_code",
+				)
+				if group_hsn:
+					item.gst_hsn_code = group_hsn
 
 		item.insert(ignore_permissions=True)
 
