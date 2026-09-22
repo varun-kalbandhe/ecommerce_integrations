@@ -275,6 +275,7 @@ class TestAmazonSettings:
 		self.enable_sync = 1
 		self.max_retry_limit = 3
 		self.create_item_if_not_exists = 1
+		self.name = "test_amazon_setting"
 		self.amazon_fields_map = [
 			frappe._dict({"amazon_field": "ASIN", "item_field": "item_code", "use_to_find_item_code": 1})
 		]
@@ -413,6 +414,7 @@ class TestAmazon(unittest.TestCase):
 			existing_item.item_code = "TEST_EXISTING_ITEM"
 			existing_item.item_name = "Existing Test Item"
 			existing_item.item_group = repo.amz_setting.parent_item_group
+			existing_item.stock_uom = "Nos"
 			if frappe.db.has_column("Item", "gst_hsn_code"):
 				existing_item.gst_hsn_code = "84672100"
 			existing_item.insert(ignore_permissions=True)
@@ -425,3 +427,36 @@ class TestAmazon(unittest.TestCase):
 
 		# Cleanup
 		frappe.delete_doc("Item", "TEST_EXISTING_ITEM", force=True)
+
+	def test_newly_created_item_receives_stock_uom(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "TEST_ASIN_UOM_1",
+			"SellerSKU": "TEST_SKU_UOM_1",
+			"OrderItemId": "TEST_ITEM_ID_UOM",
+			"Title": "Test Product With UOM",
+		}
+		repo.get_amazon_hsn = lambda oi: "30049099"
+
+		if frappe.db.exists("Item", "TEST_ASIN_UOM_1"):
+			frappe.delete_doc("Item", "TEST_ASIN_UOM_1", force=True)
+
+		item_code = repo.create_item(order_item)
+		item_doc = frappe.get_doc("Item", item_code)
+
+		self.assertEqual(item_doc.stock_uom, "Nos")
+		self.assertTrue(len(item_doc.uoms) > 0)
+		self.assertEqual(item_doc.uoms[0].uom, "Nos")
+		self.assertEqual(item_doc.uoms[0].conversion_factor, 1)
+
+		# Cleanup
+		frappe.delete_doc("Item", item_code, force=True)
+
+	def test_order_items_preparation_has_uom(self):
+		repo = TestAmazonRepository()
+		order_items = repo.get_order_items("902-1845936-5435065")
+		self.assertTrue(len(order_items) > 0)
+		first_item = order_items[0]
+		self.assertEqual(first_item.get("uom"), "Nos")
+		self.assertEqual(first_item.get("stock_uom"), "Nos")
+		self.assertEqual(first_item.get("conversion_factor"), 1)

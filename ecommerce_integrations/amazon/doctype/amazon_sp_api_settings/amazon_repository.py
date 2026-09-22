@@ -287,6 +287,7 @@ class AmazonRepository:
 		item.item_group = create_item_group(amazon_item)
 		item.brand = create_brand(amazon_item)
 		item.manufacturer = create_manufacturer(amazon_item)
+		item.stock_uom = "Nos"
 
 		if frappe.db.has_column("Item", "gst_hsn_code"):
 			amazon_hsn = self.get_amazon_hsn(order_item)
@@ -348,9 +349,10 @@ class AmazonRepository:
 							"description": order_item.get("Title"),
 							"rate": order_item.get("ItemPrice", {}).get("Amount", 0),
 							"qty": order_item.get("QuantityOrdered"),
+							"uom": "Nos",
 							"stock_uom": "Nos",
 							"warehouse": warehouse,
-							"conversion_factor": 1.0,
+							"conversion_factor": 1,
 						}
 					)
 
@@ -553,10 +555,12 @@ class AmazonRepository:
 			self._seller_id = self.amz_setting.seller_id
 			return self._seller_id
 
-		cached = frappe.cache.hget("amazon_sp_api_seller_id", self.amz_setting.name)
-		if cached:
-			self._seller_id = cached
-			return self._seller_id
+		setting_name = getattr(self.amz_setting, "name", None)
+		if setting_name:
+			cached = frappe.cache.hget("amazon_sp_api_seller_id", setting_name)
+			if cached:
+				self._seller_id = cached
+				return self._seller_id
 
 		if asin:
 			try:
@@ -570,7 +574,8 @@ class AmazonRepository:
 				)
 				if seller_id:
 					self._seller_id = seller_id
-					frappe.cache.hset("amazon_sp_api_seller_id", self.amz_setting.name, seller_id)
+					if setting_name:
+						frappe.cache.hset("amazon_sp_api_seller_id", setting_name, seller_id)
 					return self._seller_id
 			except Exception as e:
 				frappe.log_error(message=str(e), title="Failed to resolve Amazon Seller ID")
