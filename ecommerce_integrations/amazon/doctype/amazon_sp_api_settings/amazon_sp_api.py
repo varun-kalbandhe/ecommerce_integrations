@@ -209,19 +209,29 @@ class Orders(SPAPI):
 class CatalogItems(SPAPI):
 	"""Amazon Catalog Items API"""
 
-	BASE_URI = "/catalog/v0"
+	BASE_URI = "/catalog/2022-04-01"
 
 	def get_catalog_item(
 		self,
 		asin: str,
-		marketplace_id: str | None = None,
+		marketplace_ids: str | list | None = None,
+		included_data: str | list | None = None,
+		**kwargs,
 	) -> dict:
 		"""Returns a specified item and its attributes."""
-		if not marketplace_id:
-			marketplace_id = self.marketplace_id
+		if not marketplace_ids:
+			marketplace_ids = kwargs.get("marketplace_id") or self.marketplace_id
+
+		if isinstance(marketplace_ids, list):
+			marketplace_ids = ",".join(marketplace_ids)
+
+		if not included_data:
+			included_data = "summaries,attributes,productTypes"
+		elif isinstance(included_data, list):
+			included_data = ",".join(included_data)
 
 		append_to_base_uri = f"/items/{asin}"
-		data = dict(MarketplaceId=marketplace_id)
+		data = dict(marketplaceIds=marketplace_ids, includedData=included_data)
 
 		return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
 

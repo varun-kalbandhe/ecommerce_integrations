@@ -140,10 +140,17 @@ class TestCatalogItems(CatalogItems, TestSPAPI):
 	def get_catalog_item(
 		self,
 		asin: str,
-		marketplace_id: str | None = None,
+		marketplace_ids: str | list | None = None,
+		included_data: str | list | None = None,
+		**kwargs,
 	) -> object:
 		self.expected_response = DATA.get("get_catalog_item_200")
-		return super().get_catalog_item(asin, marketplace_id)
+		return super().get_catalog_item(
+			asin,
+			marketplace_ids=marketplace_ids,
+			included_data=included_data,
+			**kwargs,
+		)
 
 
 class TestAmazonSettings:

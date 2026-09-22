@@ -154,7 +154,14 @@ class AmazonRepository:
 
 	def create_item(self, order_item) -> str:
 		def create_item_group(amazon_item) -> str:
-			item_group_name = amazon_item.get("AttributeSets")[0].get("ProductGroup")
+			summaries = amazon_item.get("summaries") or []
+			summary = summaries[0] if summaries else {}
+
+			item_group_name = (
+				summary.get("websiteDisplayGroupName")
+				or (summary.get("browseClassification") or {}).get("displayName")
+				or self.amz_setting.parent_item_group
+			)
 
 			if item_group_name:
 				item_group = frappe.db.get_value("Item Group", filters={"item_group_name": item_group_name})
@@ -163,6 +170,12 @@ class AmazonRepository:
 					new_item_group = frappe.new_doc("Item Group")
 					new_item_group.item_group_name = item_group_name
 					new_item_group.parent_item_group = self.amz_setting.parent_item_group
+					if frappe.db.has_column("Item Group", "gst_hsn_code"):
+						parent_hsn = frappe.db.get_value(
+							"Item Group", self.amz_setting.parent_item_group, "gst_hsn_code"
+						)
+						if parent_hsn:
+							new_item_group.gst_hsn_code = parent_hsn
 					new_item_group.insert()
 					return new_item_group.item_group_name
 				return item_group
@@ -170,7 +183,15 @@ class AmazonRepository:
 			raise (KeyError("ProductGroup"))
 
 		def create_brand(amazon_item) -> str:
-			brand_name = amazon_item.get("AttributeSets")[0].get("Brand")
+			summaries = amazon_item.get("summaries") or []
+			summary = summaries[0] if summaries else {}
+			attributes = amazon_item.get("attributes") or {}
+
+			brand_name = summary.get("brand")
+			if not brand_name and attributes.get("brand"):
+				brand_entries = attributes.get("brand")
+				if isinstance(brand_entries, list) and brand_entries:
+					brand_name = brand_entries[0].get("value")
 
 			if not brand_name:
 				return
@@ -185,7 +206,15 @@ class AmazonRepository:
 			return existing_brand
 
 		def create_manufacturer(amazon_item) -> str:
-			manufacturer_name = amazon_item.get("AttributeSets")[0].get("Manufacturer")
+			summaries = amazon_item.get("summaries") or []
+			summary = summaries[0] if summaries else {}
+			attributes = amazon_item.get("attributes") or {}
+
+			manufacturer_name = summary.get("manufacturer")
+			if not manufacturer_name and attributes.get("manufacturer"):
+				mfg_entries = attributes.get("manufacturer")
+				if isinstance(mfg_entries, list) and mfg_entries:
+					manufacturer_name = mfg_entries[0].get("value")
 
 			if not manufacturer_name:
 				return
@@ -204,9 +233,12 @@ class AmazonRepository:
 		def create_item_price(amazon_item, item_code) -> None:
 			item_price = frappe.new_doc("Item Price")
 			item_price.price_list = self.amz_setting.price_list
-			item_price.price_list_rate = (
-				amazon_item.get("AttributeSets")[0].get("ListPrice", {}).get("Amount") or 0
-			)
+			attributes = amazon_item.get("attributes") or {}
+			list_price_entries = attributes.get("list_price") or []
+			price_rate = 0
+			if isinstance(list_price_entries, list) and list_price_entries:
+				price_rate = list_price_entries[0].get("value") or 0
+			item_price.price_list_rate = price_rate
 			item_price.item_code = item_code
 			item_price.insert()
 
@@ -219,7 +251,25 @@ class AmazonRepository:
 			ecommerce_item.insert(ignore_permissions=True)
 
 		catalog_items = self.get_catalog_items_instance()
-		amazon_item = catalog_items.get_catalog_item(order_item["ASIN"])["payload"]
+		amazon_item = catalog_items.get_catalog_item(order_item["ASIN"])
+
+		if not isinstance(amazon_item, dict):
+			frappe.throw(
+				_("Invalid response received from Amazon Catalog Items API for ASIN {0}.").format(
+					order_item["ASIN"]
+				)
+			)
+
+		if "errors" in amazon_item:
+			errors = amazon_item.get("errors") or []
+			first_error = errors[0] if isinstance(errors, list) and errors else {}
+			error_code = first_error.get("code", "CatalogItemError")
+			error_msg = first_error.get("message", "Unknown error from Amazon Catalog Items API.")
+			frappe.log_error(
+				message=f"{error_code}: {error_msg}",
+				title=f'Catalog Items API failed for ASIN "{order_item.get("ASIN")}"',
+			)
+			raise SPAPIError(error=error_code, error_description=error_msg)
 
 		item = frappe.new_doc("Item")
 
