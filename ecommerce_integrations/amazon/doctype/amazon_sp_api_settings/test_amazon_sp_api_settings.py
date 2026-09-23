@@ -531,7 +531,50 @@ class TestAmazon(unittest.TestCase):
 		self.assertEqual(first_item.get("stock_uom"), "Nos")
 		self.assertEqual(first_item.get("conversion_factor"), 1)
 
-	def test_item_creation_falls_back_to_item_group_hsn(self):
+	def test_assigned_item_group_hsn_used_when_amazon_hsn_none(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "TEST_ASSIGNED_GRP_HSN",
+			"SellerSKU": "TEST_ASSIGNED_GRP_SKU",
+			"OrderItemId": "TEST_ASSIGNED_GRP_ID",
+			"Title": "Test Product Assigned Group HSN",
+		}
+		repo.get_amazon_hsn = lambda oi: None
+
+		if frappe.db.exists("Item", "TEST_ASSIGNED_GRP_HSN"):
+			frappe.delete_doc("Item", "TEST_ASSIGNED_GRP_HSN", force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_ASSIGNED_GRP_HSN"})
+
+		parent_group = repo.amz_setting.parent_item_group
+		orig_parent_hsn = frappe.db.get_value("Item Group", parent_group, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+
+		assigned_group_name = "Health and Beauty"
+		if not frappe.db.exists("Item Group", assigned_group_name):
+			grp = frappe.new_doc("Item Group")
+			grp.item_group_name = assigned_group_name
+			grp.parent_item_group = parent_group
+			grp.insert(ignore_permissions=True)
+
+		orig_assigned_hsn = frappe.db.get_value("Item Group", assigned_group_name, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+
+		try:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", assigned_group_name, "gst_hsn_code", "330499")
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", "420211")
+
+			item_code = repo.create_item(order_item)
+			item_doc = frappe.get_doc("Item", item_code)
+			if frappe.db.has_column("Item", "gst_hsn_code"):
+				self.assertEqual(item_doc.gst_hsn_code, "330499")
+		finally:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", assigned_group_name, "gst_hsn_code", orig_assigned_hsn)
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", orig_parent_hsn)
+			if frappe.db.exists("Item", "TEST_ASSIGNED_GRP_HSN"):
+				frappe.delete_doc("Item", "TEST_ASSIGNED_GRP_HSN", force=True)
+			frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_ASSIGNED_GRP_HSN"})
+
+	def test_item_creation_falls_back_to_parent_item_group_hsn(self):
 		repo = TestAmazonRepository()
 		order_item = {
 			"ASIN": "TEST_FALLBACK_HSN",
@@ -547,11 +590,19 @@ class TestAmazon(unittest.TestCase):
 
 		parent_group = repo.amz_setting.parent_item_group
 		orig_hsn = frappe.db.get_value("Item Group", parent_group, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+
+		assigned_group_name = "Health and Beauty"
+		if not frappe.db.exists("Item Group", assigned_group_name):
+			grp = frappe.new_doc("Item Group")
+			grp.item_group_name = assigned_group_name
+			grp.parent_item_group = parent_group
+			grp.insert(ignore_permissions=True)
+		orig_assigned_hsn = frappe.db.get_value("Item Group", assigned_group_name, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+
 		try:
 			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", assigned_group_name, "gst_hsn_code", None)
 				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", "420211")
-				if frappe.db.exists("Item Group", "Health and Beauty"):
-					frappe.delete_doc("Item Group", "Health and Beauty", force=True)
 
 			item_code = repo.create_item(order_item)
 			item_doc = frappe.get_doc("Item", item_code)
@@ -559,6 +610,7 @@ class TestAmazon(unittest.TestCase):
 				self.assertEqual(item_doc.gst_hsn_code, "420211")
 		finally:
 			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", assigned_group_name, "gst_hsn_code", orig_assigned_hsn)
 				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", orig_hsn)
 			if frappe.db.exists("Item", "TEST_FALLBACK_HSN"):
 				frappe.delete_doc("Item", "TEST_FALLBACK_HSN", force=True)
@@ -597,7 +649,7 @@ class TestAmazon(unittest.TestCase):
 				frappe.delete_doc("Item", "TEST_PRECEDENCE_HSN", force=True)
 			frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_PRECEDENCE_HSN"})
 
-	def test_item_creation_without_any_hsn_raises_mandatory_error(self):
+	def test_item_creation_without_any_hsn_raises_validation_error(self):
 		repo = TestAmazonRepository()
 		order_item = {
 			"ASIN": "TEST_NO_HSN",
@@ -613,23 +665,79 @@ class TestAmazon(unittest.TestCase):
 
 		parent_group = repo.amz_setting.parent_item_group
 		orig_hsn = frappe.db.get_value("Item Group", parent_group, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+		assigned_group_name = "Health and Beauty"
+		orig_assigned_hsn = frappe.db.get_value("Item Group", assigned_group_name, "gst_hsn_code") if (frappe.db.exists("Item Group", assigned_group_name) and frappe.db.has_column("Item Group", "gst_hsn_code")) else None
+
 		try:
 			if frappe.db.has_column("Item Group", "gst_hsn_code"):
 				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", None)
-				if frappe.db.exists("Item Group", "Health and Beauty"):
-					frappe.delete_doc("Item Group", "Health and Beauty", force=True)
+				if frappe.db.exists("Item Group", assigned_group_name):
+					frappe.db.set_value("Item Group", assigned_group_name, "gst_hsn_code", None)
 
-			if frappe.db.get_single_value("GST Settings", "validate_hsn_code"):
-				with self.assertRaises(frappe.MandatoryError):
-					repo.create_item(order_item)
-			else:
-				item_code = repo.create_item(order_item)
-				item_doc = frappe.get_doc("Item", item_code)
-				self.assertIsNone(item_doc.gst_hsn_code)
-				frappe.delete_doc("Item", item_code, force=True)
+			with self.assertRaises(frappe.ValidationError) as cm:
+				repo.create_item(order_item)
+
+			err_msg = str(cm.exception)
+			self.assertIn("TEST_NO_HSN", err_msg)
+			self.assertIn("TEST_NO_HSN_SKU", err_msg)
+			self.assertIn("Item Group", err_msg)
+			self.assertIn("Amazon did not provide an HSN and no fallback HSN is configured", err_msg)
+
+			# Prove item was NOT created/inserted
+			self.assertFalse(frappe.db.exists("Item", "TEST_NO_HSN"))
 		finally:
 			if frappe.db.has_column("Item Group", "gst_hsn_code"):
 				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", orig_hsn)
+				if frappe.db.exists("Item Group", assigned_group_name):
+					frappe.db.set_value("Item Group", assigned_group_name, "gst_hsn_code", orig_assigned_hsn)
 			if frappe.db.exists("Item", "TEST_NO_HSN"):
 				frappe.delete_doc("Item", "TEST_NO_HSN", force=True)
 			frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_NO_HSN"})
+
+	def test_product_tax_code_never_used_as_gst_hsn_code(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "TEST_PTC_ASIN",
+			"SellerSKU": "TEST_PTC_SKU",
+			"OrderItemId": "TEST_PTC_ID",
+			"Title": "Test Product With PTC",
+		}
+		mock_client = unittest.mock.MagicMock()
+		mock_client.get_listings_item.return_value = {
+			"sku": "TEST_PTC_SKU",
+			"attributes": {
+				"product_tax_code": [
+					{"value": "A_GEN_SUPERREDUCED", "marketplace_id": "A21TJRUUN4KGV"}
+				]
+			},
+		}
+		repo.get_listings_items_instance = lambda: mock_client
+
+		# 1. get_amazon_hsn must return None (PTC is not an HSN)
+		hsn = repo.get_amazon_hsn(order_item)
+		self.assertIsNone(hsn)
+
+		# 2. create_item falls back to parent item group HSN and never uses product_tax_code
+		if frappe.db.exists("Item", "TEST_PTC_ASIN"):
+			frappe.delete_doc("Item", "TEST_PTC_ASIN", force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_PTC_ASIN"})
+
+		parent_group = repo.amz_setting.parent_item_group
+		orig_hsn = frappe.db.get_value("Item Group", parent_group, "gst_hsn_code") if frappe.db.has_column("Item Group", "gst_hsn_code") else None
+		try:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", "12119032")
+				if frappe.db.exists("Item Group", "Health and Beauty"):
+					frappe.delete_doc("Item Group", "Health and Beauty", force=True)
+
+			item_code = repo.create_item(order_item)
+			item_doc = frappe.get_doc("Item", item_code)
+			if frappe.db.has_column("Item", "gst_hsn_code"):
+				self.assertNotEqual(item_doc.gst_hsn_code, "A_GEN_SUPERREDUCED")
+				self.assertEqual(item_doc.gst_hsn_code, "12119032")
+		finally:
+			if frappe.db.has_column("Item Group", "gst_hsn_code"):
+				frappe.db.set_value("Item Group", parent_group, "gst_hsn_code", orig_hsn)
+			if frappe.db.exists("Item", "TEST_PTC_ASIN"):
+				frappe.delete_doc("Item", "TEST_PTC_ASIN", force=True)
+			frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_PTC_ASIN"})

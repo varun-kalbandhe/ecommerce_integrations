@@ -330,15 +330,15 @@ class AmazonRepository:
 		item.manufacturer = create_manufacturer(amazon_item)
 		item.stock_uom = "Nos"
 
-		# 1. Call: amazon_hsn = self.get_amazon_hsn(order_item)
+		# Required HSN priority:
+		# Priority 1: Amazon HSN returned by get_amazon_hsn(order_item)
 		amazon_hsn = self.get_amazon_hsn(order_item)
 
-		# 2. If amazon_hsn is returned: item.gst_hsn_code = amazon_hsn
+		final_hsn = None
 		if amazon_hsn:
-			item.gst_hsn_code = str(amazon_hsn).strip()
-			item.set("gst_hsn_code", item.gst_hsn_code)
+			final_hsn = str(amazon_hsn).strip()
 		else:
-			# 3. If Amazon HSN is not returned: fetch from Item Group / parent Item Group
+			# Priority 2: If Amazon HSN is unavailable, read gst_hsn_code from actual Item Group
 			group_hsn = None
 			if item.item_group:
 				try:
@@ -349,18 +349,43 @@ class AmazonRepository:
 					)
 				except Exception:
 					group_hsn = None
-			if not group_hsn and self.amz_setting.parent_item_group:
+			if group_hsn:
+				final_hsn = str(group_hsn).strip()
+			elif self.amz_setting.parent_item_group:
+				# Priority 3: If that Item Group has no HSN, read gst_hsn_code from configured parent_item_group
+				parent_hsn = None
 				try:
-					group_hsn = frappe.db.get_value(
+					parent_hsn = frappe.db.get_value(
 						"Item Group",
 						self.amz_setting.parent_item_group,
 						"gst_hsn_code",
 					)
 				except Exception:
-					group_hsn = None
-			if group_hsn:
-				item.gst_hsn_code = str(group_hsn).strip()
-				item.set("gst_hsn_code", item.gst_hsn_code)
+					parent_hsn = None
+				if parent_hsn:
+					final_hsn = str(parent_hsn).strip()
+
+		# Priority 4: If no HSN exists from any source, stop creation with a clear ValidationError before item.insert().
+		if final_hsn:
+			item.gst_hsn_code = final_hsn
+			item.set("gst_hsn_code", final_hsn)
+		else:
+			seller_sku = (
+				order_item.get("SellerSKU")
+				or order_item.get("seller_sku")
+				or order_item.get("sku")
+				or "-"
+			)
+			asin_code = order_item.get("ASIN") or order_item.get("asin") or asin or "-"
+			item_group_name = item.item_group or "-"
+			msg = _(
+				"HSN/SAC Code unavailable for Amazon item.\n"
+				"ASIN: {0}\n"
+				"Seller SKU: {1}\n"
+				"Item Group: {2}\n"
+				"Amazon did not provide an HSN and no fallback HSN is configured on the Item Group or Amazon parent Item Group."
+			).format(asin_code, seller_sku, item_group_name)
+			frappe.throw(msg, exc=frappe.ValidationError)
 
 		# 4. Before item.insert(), ensure the value being assigned is actually on the Item document.
 		item.insert(ignore_permissions=True)
