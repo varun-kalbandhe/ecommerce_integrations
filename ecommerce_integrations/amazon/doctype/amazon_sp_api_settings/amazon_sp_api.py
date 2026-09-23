@@ -266,7 +266,9 @@ class ListingsItems(SPAPI):
 		elif isinstance(included_data, list):
 			included_data = ",".join(included_data)
 
-		append_to_base_uri = f"/items/{seller_id}/{sku}"
+		from urllib.parse import quote
+
+		append_to_base_uri = f"/items/{seller_id}/{quote(str(sku), safe='')}"
 		params = dict(marketplaceIds=marketplace_ids, includedData=included_data)
 
 		return self.make_request(append_to_base_uri=append_to_base_uri, params=params)

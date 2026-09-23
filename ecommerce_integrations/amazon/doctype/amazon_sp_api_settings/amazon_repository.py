@@ -155,6 +155,23 @@ class AmazonRepository:
 		return Orders(**self.instance_params)
 
 	def create_item(self, order_item) -> str:
+		# 1. Existing Item -> return unchanged
+		item_code = order_item.get("ASIN") or order_item.get("asin")
+		if item_code and frappe.db.exists("Item", item_code):
+			return item_code
+
+		for field_map in getattr(self.amz_setting, "amazon_fields_map", []):
+			if field_map.use_to_find_item_code:
+				val = order_item.get(field_map.amazon_field)
+				if val:
+					existing_code = frappe.db.get_value(
+						"Item",
+						filters={field_map.item_field: val},
+						fieldname="item_code",
+					)
+					if existing_code:
+						return existing_code
+
 		def create_item_group(amazon_item) -> str:
 			summaries = amazon_item.get("summaries") or []
 			summary = summaries[0] if summaries else {}
@@ -172,9 +189,17 @@ class AmazonRepository:
 					new_item_group = frappe.new_doc("Item Group")
 					new_item_group.item_group_name = item_group_name
 					new_item_group.parent_item_group = self.amz_setting.parent_item_group
-					if frappe.db.has_column("Item Group", "custom_description"):
+					has_custom_desc = (
+						frappe.get_meta("Item Group").has_field("custom_description")
+						or frappe.db.has_column("Item Group", "custom_description")
+					)
+					if has_custom_desc:
 						new_item_group.custom_description = item_group_name
-					if frappe.db.has_column("Item Group", "gst_hsn_code"):
+					has_group_hsn = (
+						frappe.get_meta("Item Group").has_field("gst_hsn_code")
+						or frappe.db.has_column("Item Group", "gst_hsn_code")
+					)
+					if has_group_hsn:
 						parent_hsn = frappe.db.get_value(
 							"Item Group", self.amz_setting.parent_item_group, "gst_hsn_code"
 						)
@@ -247,20 +272,36 @@ class AmazonRepository:
 			item_price.insert()
 
 		def create_ecommerce_item(order_item, item_code) -> None:
+			asin = order_item.get("ASIN") or order_item.get("asin")
+			sku = (
+				order_item.get("SellerSKU")
+				or order_item.get("seller_sku")
+				or order_item.get("sku")
+			)
+			integration = frappe.get_meta("Amazon SP API Settings").module
+			if frappe.db.exists("Ecommerce Item", {"integration": integration, "integration_item_code": asin}):
+				return
+			if sku and frappe.db.exists("Ecommerce Item", {"integration": integration, "sku": sku}):
+				return
+
 			ecommerce_item = frappe.new_doc("Ecommerce Item")
-			ecommerce_item.integration = frappe.get_meta("Amazon SP API Settings").module
+			ecommerce_item.integration = integration
 			ecommerce_item.erpnext_item_code = item_code
-			ecommerce_item.integration_item_code = order_item["ASIN"]
-			ecommerce_item.sku = order_item["SellerSKU"]
-			ecommerce_item.insert(ignore_permissions=True)
+			ecommerce_item.integration_item_code = asin
+			ecommerce_item.sku = sku
+			try:
+				ecommerce_item.insert(ignore_permissions=True)
+			except frappe.DuplicateEntryError:
+				pass
 
 		catalog_items = self.get_catalog_items_instance()
-		amazon_item = catalog_items.get_catalog_item(order_item["ASIN"])
+		asin = order_item.get("ASIN") or order_item.get("asin")
+		amazon_item = catalog_items.get_catalog_item(asin)
 
 		if not isinstance(amazon_item, dict):
 			frappe.throw(
 				_("Invalid response received from Amazon Catalog Items API for ASIN {0}.").format(
-					order_item["ASIN"]
+					asin
 				)
 			)
 
@@ -271,7 +312,7 @@ class AmazonRepository:
 			error_msg = first_error.get("message", "Unknown error from Amazon Catalog Items API.")
 			frappe.log_error(
 				message=f"{error_code}: {error_msg}",
-				title=f'Catalog Items API failed for ASIN "{order_item.get("ASIN")}"',
+				title=f'Catalog Items API failed for ASIN "{asin}"',
 			)
 			raise SPAPIError(error=error_code, error_description=error_msg)
 
@@ -289,19 +330,34 @@ class AmazonRepository:
 		item.manufacturer = create_manufacturer(amazon_item)
 		item.stock_uom = "Nos"
 
-		if frappe.db.has_column("Item", "gst_hsn_code"):
-			amazon_hsn = self.get_amazon_hsn(order_item)
-			if amazon_hsn:
-				item.gst_hsn_code = amazon_hsn
-			elif frappe.db.has_column("Item Group", "gst_hsn_code"):
-				group_hsn = frappe.db.get_value(
-					"Item Group",
-					item.item_group,
-					"gst_hsn_code",
-				)
+		# 2. Amazon Listings HSN -> Item.gst_hsn_code
+		amazon_hsn = self.get_amazon_hsn(order_item)
+		if amazon_hsn:
+			item.gst_hsn_code = amazon_hsn
+		else:
+			# 3. Item Group gst_hsn_code -> Item.gst_hsn_code
+			has_group_hsn_field = (
+				frappe.get_meta("Item Group").has_field("gst_hsn_code")
+				or frappe.db.has_column("Item Group", "gst_hsn_code")
+			)
+			if has_group_hsn_field:
+				group_hsn = None
+				if item.item_group:
+					group_hsn = frappe.db.get_value(
+						"Item Group",
+						item.item_group,
+						"gst_hsn_code",
+					)
+				if not group_hsn and self.amz_setting.parent_item_group:
+					group_hsn = frappe.db.get_value(
+						"Item Group",
+						self.amz_setting.parent_item_group,
+						"gst_hsn_code",
+					)
 				if group_hsn:
 					item.gst_hsn_code = group_hsn
 
+		# 4. No HSN -> let India Compliance raise the normal validation error
 		item.insert(ignore_permissions=True)
 
 		create_item_price(amazon_item, item.item_code)
@@ -559,8 +615,12 @@ class AmazonRepository:
 		if getattr(self, "_seller_id", None):
 			return self._seller_id
 
-		if getattr(self.amz_setting, "seller_id", None):
-			self._seller_id = self.amz_setting.seller_id
+		setting_seller_id = (
+			getattr(self.amz_setting, "seller_id", None)
+			or getattr(self.amz_setting, "merchant_id", None)
+		)
+		if setting_seller_id:
+			self._seller_id = setting_seller_id
 			return self._seller_id
 
 		setting_name = getattr(self.amz_setting, "name", None)
@@ -585,17 +645,27 @@ class AmazonRepository:
 					if setting_name:
 						frappe.cache.hset("amazon_sp_api_seller_id", setting_name, seller_id)
 					return self._seller_id
+				elif isinstance(resp, dict) and "errors" in resp:
+					frappe.log_error(
+						message=f"Product Fees API returned errors: {resp.get('errors')}",
+						title="Failed to resolve Amazon Seller ID",
+					)
 			except Exception as e:
 				frappe.log_error(message=str(e), title="Failed to resolve Amazon Seller ID")
 
 		return None
 
 	def get_amazon_hsn(self, order_item) -> str | None:
-		seller_sku = order_item.get("SellerSKU")
+		seller_sku = (
+			order_item.get("SellerSKU")
+			or order_item.get("seller_sku")
+			or order_item.get("sku")
+		)
 		if not seller_sku:
 			return None
 
-		seller_id = self.get_seller_id(asin=order_item.get("ASIN"))
+		asin = order_item.get("ASIN") or order_item.get("asin")
+		seller_id = self.get_seller_id(asin=asin)
 		if not seller_id:
 			return None
 
@@ -606,15 +676,22 @@ class AmazonRepository:
 				sku=seller_sku,
 			)
 			if not isinstance(listing, dict) or "errors" in listing:
+				if isinstance(listing, dict) and "errors" in listing:
+					frappe.log_error(
+						message=f"Listings Items API returned errors: {listing.get('errors')}",
+						title=f'Listings Items API failed to retrieve HSN for SKU "{seller_sku}"',
+					)
 				return None
 
-			attributes = listing.get("attributes") or {}
+			attributes = listing.get("attributes") or listing.get("payload", {}).get("attributes") or {}
 			ext_info = attributes.get("external_product_information") or []
+			if isinstance(ext_info, dict):
+				ext_info = [ext_info]
 			if isinstance(ext_info, list):
 				for entry in ext_info:
 					if isinstance(entry, dict):
-						entity = entry.get("entity")
-						if entity in ("HSN Code", "HSN"):
+						entity = str(entry.get("entity", "")).strip().lower()
+						if entity in ("hsn code", "hsn"):
 							val = entry.get("value")
 							if val:
 								return str(val).strip()

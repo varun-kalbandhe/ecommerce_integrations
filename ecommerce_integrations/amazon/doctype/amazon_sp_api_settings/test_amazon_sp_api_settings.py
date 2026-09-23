@@ -406,31 +406,95 @@ class TestAmazon(unittest.TestCase):
 				ig.custom_description = ig.item_group_name
 			self.assertEqual(ig.custom_description, "_Test Custom Desc Group")
 
+	def test_b0gystcr27_item_creation_receives_amazon_hsn(self):
+		repo = TestAmazonRepository()
+		order_item = {
+			"ASIN": "B0GYSTCR27",
+			"SellerSKU": "100343",
+			"OrderItemId": "TEST_B0GYSTCR27_ID",
+			"Title": "6 Pcs Collector Gel Ultra Pain Relief Gel",
+		}
+		# 1. Amazon Listings HSN extraction dynamically returns 30049099
+		amazon_hsn = repo.get_amazon_hsn(order_item)
+		self.assertEqual(amazon_hsn, "30049099")
+
+		# 2. When creating an item with B0GYSTCR27 / 100343, Amazon HSN 30049099 is assigned
+		test_asin = "TEST_B0GYSTCR27_NEW"
+		test_sku = "TEST_100343_NEW"
+		test_order_item = {
+			"ASIN": test_asin,
+			"SellerSKU": test_sku,
+			"OrderItemId": "TEST_B0GYSTCR27_ID",
+			"Title": "6 Pcs Collector Gel Ultra Pain Relief Gel",
+		}
+		if frappe.db.exists("Item", test_asin):
+			frappe.delete_doc("Item", test_asin, force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": test_asin})
+		frappe.db.delete("Ecommerce Item", {"sku": test_sku})
+
+		orig_get_hsn = repo.get_amazon_hsn
+		repo.get_amazon_hsn = lambda oi: orig_get_hsn(order_item) if oi.get("ASIN") == test_asin else orig_get_hsn(oi)
+
+		try:
+			item_code = repo.create_item(test_order_item)
+			item_doc = frappe.get_doc("Item", item_code)
+			if frappe.db.has_column("Item", "gst_hsn_code"):
+				self.assertEqual(item_doc.gst_hsn_code, "30049099")
+		finally:
+			if frappe.db.exists("Item", test_asin):
+				frappe.delete_doc("Item", test_asin, force=True)
+			frappe.db.delete("Ecommerce Item", {"integration_item_code": test_asin})
+			frappe.db.delete("Ecommerce Item", {"sku": test_sku})
+
+		if not frappe.db.exists("Item", "B0GYSTCR27"):
+			try:
+				item_code = repo.create_item(order_item)
+				item_doc = frappe.get_doc("Item", item_code)
+				if frappe.db.has_column("Item", "gst_hsn_code"):
+					self.assertEqual(item_doc.gst_hsn_code, "30049099")
+			finally:
+				if frappe.db.exists("Item", "B0GYSTCR27"):
+					frappe.delete_doc("Item", "B0GYSTCR27", force=True)
+				frappe.db.delete("Ecommerce Item", {"integration_item_code": "B0GYSTCR27"})
+
 	def test_existing_item_hsn_not_overwritten(self):
 		repo = TestAmazonRepository()
 		order_item = {
 			"ASIN": "TEST_EXISTING_ITEM",
 			"SellerSKU": "TEST_EXISTING_SKU",
+			"Title": "Existing Test Item",
 		}
-		# If item already exists in DB
-		if not frappe.db.exists("Item", "TEST_EXISTING_ITEM"):
-			existing_item = frappe.new_doc("Item")
-			existing_item.item_code = "TEST_EXISTING_ITEM"
-			existing_item.item_name = "Existing Test Item"
-			existing_item.item_group = repo.amz_setting.parent_item_group
-			existing_item.stock_uom = "Nos"
-			if frappe.db.has_column("Item", "gst_hsn_code"):
-				existing_item.gst_hsn_code = "84672100"
-			existing_item.insert(ignore_permissions=True)
+		if frappe.db.exists("Item", "TEST_EXISTING_ITEM"):
+			frappe.delete_doc("Item", "TEST_EXISTING_ITEM", force=True)
+		frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_EXISTING_ITEM"})
 
-		item_code = repo.get_item_code(order_item)
-		self.assertEqual(item_code, "TEST_EXISTING_ITEM")
-		item_doc = frappe.get_doc("Item", item_code)
+		existing_item = frappe.new_doc("Item")
+		existing_item.item_code = "TEST_EXISTING_ITEM"
+		existing_item.item_name = "Existing Test Item"
+		existing_item.item_group = repo.amz_setting.parent_item_group
+		existing_item.stock_uom = "Nos"
 		if frappe.db.has_column("Item", "gst_hsn_code"):
-			self.assertEqual(item_doc.gst_hsn_code, "84672100")
+			existing_item.gst_hsn_code = "84672100"
+		existing_item.insert(ignore_permissions=True)
 
-		# Cleanup
-		frappe.delete_doc("Item", "TEST_EXISTING_ITEM", force=True)
+		try:
+			repo.get_amazon_hsn = lambda oi: "30049099"
+
+			item_code = repo.get_item_code(order_item)
+			self.assertEqual(item_code, "TEST_EXISTING_ITEM")
+			item_doc = frappe.get_doc("Item", item_code)
+			if frappe.db.has_column("Item", "gst_hsn_code"):
+				self.assertEqual(item_doc.gst_hsn_code, "84672100")
+
+			created_code = repo.create_item(order_item)
+			self.assertEqual(created_code, "TEST_EXISTING_ITEM")
+			item_doc_after = frappe.get_doc("Item", created_code)
+			if frappe.db.has_column("Item", "gst_hsn_code"):
+				self.assertEqual(item_doc_after.gst_hsn_code, "84672100")
+		finally:
+			if frappe.db.exists("Item", "TEST_EXISTING_ITEM"):
+				frappe.delete_doc("Item", "TEST_EXISTING_ITEM", force=True)
+			frappe.db.delete("Ecommerce Item", {"integration_item_code": "TEST_EXISTING_ITEM"})
 
 	def test_newly_created_item_receives_stock_uom(self):
 		repo = TestAmazonRepository()
