@@ -330,34 +330,39 @@ class AmazonRepository:
 		item.manufacturer = create_manufacturer(amazon_item)
 		item.stock_uom = "Nos"
 
-		# 2. Amazon Listings HSN -> Item.gst_hsn_code
+		# 1. Call: amazon_hsn = self.get_amazon_hsn(order_item)
 		amazon_hsn = self.get_amazon_hsn(order_item)
+
+		# 2. If amazon_hsn is returned: item.gst_hsn_code = amazon_hsn
 		if amazon_hsn:
-			item.gst_hsn_code = amazon_hsn
+			item.gst_hsn_code = str(amazon_hsn).strip()
+			item.set("gst_hsn_code", item.gst_hsn_code)
 		else:
-			# 3. Item Group gst_hsn_code -> Item.gst_hsn_code
-			has_group_hsn_field = (
-				frappe.get_meta("Item Group").has_field("gst_hsn_code")
-				or frappe.db.has_column("Item Group", "gst_hsn_code")
-			)
-			if has_group_hsn_field:
-				group_hsn = None
-				if item.item_group:
+			# 3. If Amazon HSN is not returned: fetch from Item Group / parent Item Group
+			group_hsn = None
+			if item.item_group:
+				try:
 					group_hsn = frappe.db.get_value(
 						"Item Group",
 						item.item_group,
 						"gst_hsn_code",
 					)
-				if not group_hsn and self.amz_setting.parent_item_group:
+				except Exception:
+					group_hsn = None
+			if not group_hsn and self.amz_setting.parent_item_group:
+				try:
 					group_hsn = frappe.db.get_value(
 						"Item Group",
 						self.amz_setting.parent_item_group,
 						"gst_hsn_code",
 					)
-				if group_hsn:
-					item.gst_hsn_code = group_hsn
+				except Exception:
+					group_hsn = None
+			if group_hsn:
+				item.gst_hsn_code = str(group_hsn).strip()
+				item.set("gst_hsn_code", item.gst_hsn_code)
 
-		# 4. No HSN -> let India Compliance raise the normal validation error
+		# 4. Before item.insert(), ensure the value being assigned is actually on the Item document.
 		item.insert(ignore_permissions=True)
 
 		create_item_price(amazon_item, item.item_code)
