@@ -150,7 +150,17 @@ def schedule_get_order_details():
 
 @frappe.whitelist()
 def sync_amazon_orders():
-	schedule_get_order_details()
+	from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_repository import get_orders
+
+	amz_settings = frappe.get_all(
+		"Amazon SP API Settings",
+		filters={"is_active": 1},
+		fields=["name", "after_date"],
+	)
+
+	for amz_setting in amz_settings:
+		get_orders(amz_setting_name=amz_setting.name, created_after=amz_setting.after_date)
+	
 	return True
 
 def setup_custom_fields():
