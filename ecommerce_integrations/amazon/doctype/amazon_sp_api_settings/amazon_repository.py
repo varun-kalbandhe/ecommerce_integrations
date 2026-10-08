@@ -1205,7 +1205,7 @@ class AmazonRepository:
 
 		return si.name
 
-	def get_orders(self, created_after: str | None = None, last_updated_after: str | None = None) -> list:
+	def get_orders(self, created_after: str | None = None, created_before: str | None = None, last_updated_after: str | None = None) -> list:
 		orders = self.get_orders_instance()
 		order_statuses = [
 			"PendingAvailability",
@@ -1226,6 +1226,8 @@ class AmazonRepository:
 		}
 		if created_after:
 			kwargs["created_after"] = created_after
+		if created_before:
+			kwargs["created_before"] = created_before
 		if last_updated_after:
 			kwargs["last_updated_after"] = last_updated_after
 
@@ -2076,9 +2078,9 @@ def validate_amazon_sp_api_credentials(**args) -> None:
 		frappe.throw(msg)
 
 
-def get_orders(amz_setting_name, created_after=None, last_updated_after=None) -> list:
+def get_orders(amz_setting_name, created_after=None, created_before=None, last_updated_after=None) -> list:
 	ar = AmazonRepository(amz_setting_name)
-	return ar.get_orders(created_after=created_after, last_updated_after=last_updated_after)
+	return ar.get_orders(created_after=created_after, created_before=created_before, last_updated_after=last_updated_after)
 
 
 def create_sales_invoice(amz_setting_name: str, sales_order_name: str, order: dict | None = None, order_items: list | None = None) -> str:

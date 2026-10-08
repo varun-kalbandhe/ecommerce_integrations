@@ -123,6 +123,7 @@ class AmazonSPAPISettings(Document):
 				method=get_orders,
 				amz_setting_name=self.name,
 				created_after=self.after_date,
+				created_before=self.before_date,
 				timeout=4000,
 				now=frappe.flags.in_test,
 			)
@@ -141,11 +142,11 @@ def schedule_get_order_details():
 	amz_settings = frappe.get_all(
 		"Amazon SP API Settings",
 		filters={"is_active": 1, "enable_sync": 1},
-		fields=["name", "after_date"],
+		fields=["name", "after_date", "before_date"],
 	)
 
 	for amz_setting in amz_settings:
-		get_orders(amz_setting_name=amz_setting.name, created_after=amz_setting.after_date)
+		get_orders(amz_setting_name=amz_setting.name, created_after=amz_setting.after_date, created_before=amz_setting.before_date)
 
 
 @frappe.whitelist()
@@ -155,11 +156,11 @@ def sync_amazon_orders():
 	amz_settings = frappe.get_all(
 		"Amazon SP API Settings",
 		filters={"is_active": 1},
-		fields=["name", "after_date"],
+		fields=["name", "after_date", "before_date"],
 	)
 
 	for amz_setting in amz_settings:
-		get_orders(amz_setting_name=amz_setting.name, created_after=amz_setting.after_date)
+		get_orders(amz_setting_name=amz_setting.name, created_after=amz_setting.after_date, created_before=amz_setting.before_date)
 	
 	return True
 

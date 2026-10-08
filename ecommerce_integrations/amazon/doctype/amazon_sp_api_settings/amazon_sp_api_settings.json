@@ -167,6 +167,12 @@
    "reqd": 1
   },
   {
+   "default": "Today",
+   "fieldname": "before_date",
+   "fieldtype": "Date",
+   "label": "Before Date"
+  },
+  {
    "default": "0",
    "description": "Get financial breakup of Taxes and charges data by Amazon ",
    "fieldname": "taxes_charges",
