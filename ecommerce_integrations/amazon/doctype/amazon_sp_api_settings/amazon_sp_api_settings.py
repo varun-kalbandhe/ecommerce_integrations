@@ -148,6 +148,11 @@ def schedule_get_order_details():
 		get_orders(amz_setting_name=amz_setting.name, created_after=amz_setting.after_date)
 
 
+@frappe.whitelist()
+def sync_amazon_orders():
+	schedule_get_order_details()
+	return True
+
 def setup_custom_fields():
 	custom_fields = {
 		"Sales Order": [
