@@ -60,4 +60,4 @@ def create_tax_account():
 			"account_type": "Tax",
 			"tax_rate": 18,
 		}
-	).insert()
+	).insert(ignore_if_duplicate=True)

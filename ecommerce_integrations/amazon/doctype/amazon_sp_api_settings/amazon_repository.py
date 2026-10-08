@@ -14,6 +14,7 @@ from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api 
 	SPAPI,
 	CatalogItems,
 	Finances,
+	FinancesV20240619,
 	ListingsItems,
 	Orders,
 	ProductFees,
@@ -75,6 +76,96 @@ class AmazonRepository:
 
 	def get_finances_instance(self) -> Finances:
 		return Finances(**self.instance_params)
+
+	def get_finances_v20240619_instance(self) -> FinancesV20240619:
+		return FinancesV20240619(**self.instance_params)
+
+	def get_amazon_payment_status(self, order_id: str) -> dict:
+		"""
+		Determines authoritative Amazon payment/settlement confirmation status
+		using the modern Finances API (v2024-06-19 transactions endpoint).
+
+		Rules:
+		- Endpoint: GET /finances/2024-06-19/transactions
+		- Filter: relatedIdentifierName = 'ORDER_ID', relatedIdentifierValue = order_id
+		- Find transaction with transactionType == 'Shipment'
+		- Status check:
+		  - 'RELEASED' or 'DEFERRED_RELEASED' -> confirmed = True
+		  - 'DEFERRED' -> confirmed = False (held in reserve)
+		  - No qualifying shipment transaction -> confirmed = False
+		- Payment amount:
+		  breakdowns[breakdownType='Sales'].breakdownAmount.currencyAmount
+		  (Never reduced by seller fees, TDS, TCS, postage, etc.)
+		"""
+		if not order_id:
+			return {"confirmed": False, "amount": 0.0, "currency": None, "source": "No order_id provided"}
+
+		try:
+			finances_client = self.get_finances_v20240619_instance()
+			resp = finances_client.list_transactions(
+				related_identifier_name="ORDER_ID",
+				related_identifier_value=order_id,
+			)
+			transactions = (resp.get("payload") or {}).get("transactions", [])
+		except Exception as e:
+			frappe.log_error(
+				title=f"Amazon payment check failed for order {order_id}",
+				message=frappe.get_traceback(),
+			)
+			return {
+				"confirmed": False,
+				"amount": 0.0,
+				"currency": None,
+				"source": f"Error: {e}",
+			}
+
+		confirmed = False
+		sales_amount = 0.0
+		currency = None
+		status_source = "No qualifying transaction"
+
+		for tx in transactions:
+			if tx.get("transactionType") == "Shipment":
+				status = tx.get("transactionStatus")
+				# Extract customer sales amount from breakdowns (never reduced by expenses/fees)
+				tx_sales = 0.0
+				tx_currency = None
+				for bd in (tx.get("breakdowns") or []):
+					if bd.get("breakdownType") == "Sales":
+						amt_dict = bd.get("breakdownAmount") or {}
+						tx_sales += float(amt_dict.get("currencyAmount") or 0.0)
+						if not tx_currency:
+							tx_currency = amt_dict.get("currencyCode")
+
+				if status in ("RELEASED", "DEFERRED_RELEASED"):
+					confirmed = True
+					status_source = f"Finances 2024-06-19: {status}"
+					sales_amount += tx_sales
+					if not currency:
+						currency = tx_currency
+				elif status == "DEFERRED":
+					if not confirmed:
+						status_source = "Finances 2024-06-19: DEFERRED"
+						if sales_amount == 0.0:
+							sales_amount = tx_sales
+							currency = tx_currency
+
+		# Structured logging per requirements
+		frappe.logger("ecommerce_integrations").info(
+			f"Amazon payment check:\n"
+			f"Order: {order_id}\n"
+			f"Confirmed: {'YES' if confirmed else 'NO'}\n"
+			f"Amount: {sales_amount}\n"
+			f"Source: {status_source}"
+		)
+
+		return {
+			"confirmed": confirmed,
+			"amount": sales_amount,
+			"currency": currency,
+			"source": status_source,
+		}
+
 
 	def get_account(self, name) -> str:
 		account_name = frappe.db.get_value("Account", {"account_name": f"Amazon {name}"})
@@ -385,7 +476,11 @@ class AmazonRepository:
 				"Item Group: {2}\n"
 				"Amazon did not provide an HSN and no fallback HSN is configured on the Item Group or Amazon parent Item Group."
 			).format(asin_code, seller_sku, item_group_name)
-			frappe.throw(msg, exc=frappe.ValidationError)
+			
+			item.item_name = f"[MISSING HSN] {item.item_name}"[:140]
+			item.description = f"<b>[MISSING HSN]</b> {msg}\n\n{item.description or ''}"
+			
+			frappe.log_error(title=f"Missing HSN for Amazon Item {seller_sku}", message=msg)
 
 		# 4. Before item.insert(), ensure the value being assigned is actually on the Item document.
 		item.insert(ignore_permissions=True)
@@ -428,11 +523,15 @@ class AmazonRepository:
 		order_items_payload = self.call_sp_api_method(sp_api_method=orders.get_order_items, order_id=order_id)
 
 		final_order_items = []
+		print(f"DEBUG: order_items_payload in get_order_items: {order_items_payload}")
 		warehouse = self.amz_setting.warehouse
 
 		while True:
-			order_items_list = order_items_payload.get("OrderItems")
-			next_token = order_items_payload.get("NextToken")
+			order_items_list = (order_items_payload or {}).get("OrderItems") or []
+			next_token = (order_items_payload or {}).get("NextToken")
+
+			if not order_items_list:
+				break
 
 			for order_item in order_items_list:
 				if order_item.get("QuantityOrdered") > 0:
@@ -461,54 +560,219 @@ class AmazonRepository:
 
 		return final_order_items
 
-	def create_sales_order(self, order) -> str | None:
-		def create_customer(order) -> str:
-			order_customer_name = ""
-			buyer_info = order.get("BuyerInfo")
+	def update_sales_order_status_fields(self, so_doc, order) -> None:
+		update_fields = {}
 
-			if buyer_info and buyer_info.get("BuyerEmail"):
-				order_customer_name = buyer_info.get("BuyerEmail")
-			else:
-				order_customer_name = f"Buyer - {order.get('AmazonOrderId')}"
+		amazon_order_status = order.get("OrderStatus")
+		if amazon_order_status is not None:
+			update_fields["amazon_order_status"] = amazon_order_status
 
-			existing_customer_name = frappe.db.get_value(
-				"Customer", filters={"name": order_customer_name}, fieldname="name"
+		amazon_fulfillment_channel = order.get("FulfillmentChannel")
+		if amazon_fulfillment_channel is not None:
+			update_fields["amazon_fulfillment_channel"] = amazon_fulfillment_channel
+
+		amazon_shipment_status = order.get("EasyShipShipmentStatus")
+		if amazon_shipment_status is not None:
+			update_fields["amazon_shipment_status"] = amazon_shipment_status
+
+		payment_method = order.get("PaymentMethod")
+		if not payment_method and order.get("PaymentMethodDetails"):
+			pm_details = order.get("PaymentMethodDetails")
+			if isinstance(pm_details, list) and pm_details:
+				payment_method = ", ".join(str(d) for d in pm_details)
+			elif isinstance(pm_details, str):
+				payment_method = pm_details
+		if payment_method is not None:
+			update_fields["amazon_payment_method"] = payment_method
+
+		cancellation_reason = (
+			order.get("CancellationReason")
+			or order.get("CancelReason")
+			or order.get("BuyerCancelReason")
+		)
+		if cancellation_reason is not None:
+			update_fields["amazon_cancellation_reason"] = cancellation_reason
+
+		if update_fields:
+			so_doc.db_set(update_fields)
+
+	def handle_sales_order_cancellation(self, so_doc, order) -> bool:
+		"""
+		Handles Amazon order cancellation based on ERPNext Sales Order docstatus:
+		- If already cancelled (docstatus == 2): no-op (idempotent).
+		- CASE A (Draft, docstatus == 0): safely delete the draft.
+		- CASE B (Submitted, docstatus == 1, no DN, no SI): cancel the Sales Order.
+		- CASE C (Submitted, DN exists, no SI): block cancellation, log manual return required.
+		- CASE D (Submitted, SI exists, no DN): block cancellation, log credit note required.
+		- CASE E (Submitted, both DN and SI exist): block cancellation, log manual action required.
+
+		Returns True if draft Sales Order was deleted, False otherwise.
+		"""
+		order_id = order.get("AmazonOrderId")
+
+		# Idempotent: Already cancelled in ERPNext
+		if so_doc.docstatus == 2:
+			return False
+
+		# CASE A: Draft Sales Order -> Delete draft safely
+		if so_doc.docstatus == 0:
+			doc_name = so_doc.name
+			frappe.log_error(
+				title=f"Amazon Order {order_id} Canceled - Draft Deleted",
+				message=f"Draft Sales Order {doc_name} was deleted because Amazon order {order_id} was canceled.",
+				reference_doctype="Sales Order",
+				reference_name=doc_name,
+			)
+			so_doc.delete()
+			return True
+
+		# Submitted Sales Order (docstatus == 1)
+		if so_doc.docstatus == 1:
+			submitted_dns = frappe.db.sql(
+				"""
+				SELECT DISTINCT parent FROM `tabDelivery Note Item`
+				WHERE against_sales_order = %s AND docstatus = 1
+				""",
+				(so_doc.name,),
+				as_dict=True,
+			)
+			dn_names = [d.parent for d in submitted_dns]
+
+			submitted_sis = frappe.db.sql(
+				"""
+				SELECT DISTINCT parent FROM `tabSales Invoice Item`
+				WHERE sales_order = %s AND docstatus = 1
+				""",
+				(so_doc.name,),
+				as_dict=True,
+			)
+			si_names = [s.parent for s in submitted_sis]
+
+			# CASE E: Both Delivery Note and Sales Invoice exist
+			if dn_names and si_names:
+				frappe.log_error(
+					title=f"Amazon Order {order_id} Canceled - Manual Action Required",
+					message=(
+						f"Sales Order {so_doc.name} cannot be automatically cancelled because submitted "
+						f"Delivery Note(s) ({', '.join(dn_names)}) and Sales Invoice(s) ({', '.join(si_names)}) exist. "
+						f"Manual return, credit-note, and refund handling is required."
+					),
+					reference_doctype="Sales Order",
+					reference_name=so_doc.name,
+				)
+				return False
+
+			# CASE C: Submitted Delivery Note exists
+			if dn_names:
+				frappe.log_error(
+					title=f"Amazon Order {order_id} Canceled - Manual Return Required",
+					message=(
+						f"Sales Order {so_doc.name} cannot be automatically cancelled because submitted "
+						f"Delivery Note(s) exist: {', '.join(dn_names)}. "
+						f"Fulfillment has already occurred; manual return/refund handling is required."
+					),
+					reference_doctype="Sales Order",
+					reference_name=so_doc.name,
+				)
+				return False
+
+			# CASE D: Submitted Sales Invoice exists
+			if si_names:
+				frappe.log_error(
+					title=f"Amazon Order {order_id} Canceled - Credit Note Required",
+					message=(
+						f"Sales Order {so_doc.name} cannot be automatically cancelled because submitted "
+						f"Sales Invoice(s) exist: {', '.join(si_names)}. "
+						f"Invoicing has already occurred; manual credit-note/refund handling is required."
+					),
+					reference_doctype="Sales Order",
+					reference_name=so_doc.name,
+				)
+				return False
+
+			# CASE B: Neither DN nor SI exist -> Cancel Sales Order
+			so_doc.cancel()
+			frappe.log_error(
+				title=f"Amazon Order {order_id} Canceled - Sales Order Cancelled",
+				message=f"Sales Order {so_doc.name} was successfully cancelled in ERPNext because Amazon order {order_id} was canceled.",
+				reference_doctype="Sales Order",
+				reference_name=so_doc.name,
+			)
+			return False
+
+		return False
+
+	def create_customer(self, order: dict) -> str:
+		order_id = order.get("AmazonOrderId") or ""
+		buyer_info = order.get("BuyerInfo") or {}
+		shipping_address = order.get("ShippingAddress") or {}
+
+		buyer_name = (
+			buyer_info.get("BuyerName")
+			or order.get("BuyerName")
+			or shipping_address.get("Name")
+			or shipping_address.get("RecipientName")
+		)
+
+		if buyer_name and str(buyer_name).strip():
+			buyer_prefix = str(buyer_name).strip()
+		else:
+			buyer_prefix = "Buyer"
+
+		order_customer_name = f"{buyer_prefix} - {order_id}" if order_id else buyer_prefix
+
+		existing_customer_name = (
+			frappe.db.get_value("Customer", filters={"name": order_customer_name}, fieldname="name")
+			or frappe.db.get_value("Customer", filters={"customer_name": order_customer_name}, fieldname="name")
+		)
+
+		if not existing_customer_name and order_id:
+			existing_customer_name = (
+				frappe.db.get_value("Customer", filters={"name": f"Buyer - {order_id}"}, fieldname="name")
+				or frappe.db.get_value("Customer", filters={"customer_name": f"Buyer - {order_id}"}, fieldname="name")
 			)
 
-			if existing_customer_name:
-				filters = [
-					["Dynamic Link", "link_doctype", "=", "Customer"],
-					["Dynamic Link", "link_name", "=", existing_customer_name],
-					["Dynamic Link", "parenttype", "=", "Contact"],
-				]
+		if existing_customer_name:
+			filters = [
+				["Dynamic Link", "link_doctype", "=", "Customer"],
+				["Dynamic Link", "link_name", "=", existing_customer_name],
+				["Dynamic Link", "parenttype", "=", "Contact"],
+			]
 
-				existing_contacts = frappe.get_list("Contact", filters)
+			existing_contacts = frappe.get_list("Contact", filters)
 
-				if not existing_contacts:
-					new_contact = frappe.new_doc("Contact")
-					new_contact.first_name = order_customer_name
-					new_contact.append(
-						"links",
-						{"link_doctype": "Customer", "link_name": existing_customer_name},
-					)
-					new_contact.insert()
-
-				return existing_customer_name
-			else:
-				new_customer = frappe.new_doc("Customer")
-				new_customer.customer_name = order_customer_name
-				new_customer.customer_group = self.amz_setting.customer_group
-				new_customer.territory = self.amz_setting.territory
-				new_customer.customer_type = self.amz_setting.customer_type
-				new_customer.save()
-
+			if not existing_contacts:
 				new_contact = frappe.new_doc("Contact")
 				new_contact.first_name = order_customer_name
-				new_contact.append("links", {"link_doctype": "Customer", "link_name": new_customer.name})
-
+				new_contact.append(
+					"links",
+					{"link_doctype": "Customer", "link_name": existing_customer_name},
+				)
+				if buyer_info and buyer_info.get("BuyerEmail"):
+					new_contact.email_id = buyer_info.get("BuyerEmail")
 				new_contact.insert()
 
-				return new_customer.name
+			return existing_customer_name
+		else:
+			new_customer = frappe.new_doc("Customer")
+			new_customer.customer_name = order_customer_name
+			new_customer.customer_group = self.amz_setting.customer_group
+			new_customer.territory = self.amz_setting.territory
+			new_customer.customer_type = self.amz_setting.customer_type
+			new_customer.save()
+
+			new_contact = frappe.new_doc("Contact")
+			new_contact.first_name = order_customer_name
+			new_contact.append("links", {"link_doctype": "Customer", "link_name": new_customer.name})
+			if buyer_info and buyer_info.get("BuyerEmail"):
+				new_contact.email_id = buyer_info.get("BuyerEmail")
+			new_contact.insert()
+
+			return new_customer.name
+
+	def create_sales_order(self, order) -> str | None:
+		def create_customer(order) -> str:
+			return self.create_customer(order)
 
 		def create_address(order, customer_name) -> str | None:
 			shipping_address = order.get("ShippingAddress")
@@ -545,7 +809,15 @@ class AmazonRepository:
 		so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
 
 		if so:
-			return so
+			so_doc = frappe.get_doc("Sales Order", so)
+			self.update_sales_order_status_fields(so_doc, order)
+
+			if order.get("OrderStatus") == "Canceled":
+				deleted = self.handle_sales_order_cancellation(so_doc, order)
+				if deleted:
+					return None
+
+			return so_doc.name
 		else:
 			items = self.get_order_items(order_id)
 
@@ -561,13 +833,39 @@ class AmazonRepository:
 			so = frappe.new_doc("Sales Order")
 			so.amazon_order_id = order_id
 			so.marketplace_id = order.get("MarketplaceId")
+			so.amazon_order_status = order.get("OrderStatus")
+			so.amazon_fulfillment_channel = order.get("FulfillmentChannel")
+			so.amazon_shipment_status = order.get("EasyShipShipmentStatus")
+
+			payment_method = order.get("PaymentMethod")
+			if not payment_method and order.get("PaymentMethodDetails"):
+				pm_details = order.get("PaymentMethodDetails")
+				if isinstance(pm_details, list) and pm_details:
+					payment_method = ", ".join(str(d) for d in pm_details)
+				elif isinstance(pm_details, str):
+					payment_method = pm_details
+			so.amazon_payment_method = payment_method
+
+			cancellation_reason = (
+				order.get("CancellationReason")
+				or order.get("CancelReason")
+				or order.get("BuyerCancelReason")
+			)
+			if cancellation_reason:
+				so.amazon_cancellation_reason = cancellation_reason
+
 			so.customer = customer_name
 			so.delivery_date = delivery_date
 			so.transaction_date = transaction_date
 			so.company = self.amz_setting.company
 
+			missing_hsn_found = False
 			for item in items:
 				so.append("items", item)
+				
+				item_name = frappe.db.get_value("Item", item["item_code"], "item_name", cache=True)
+				if item_name and item_name.startswith("[MISSING HSN]"):
+					missing_hsn_found = True
 
 			taxes_and_charges = self.amz_setting.taxes_charges
 
@@ -581,11 +879,333 @@ class AmazonRepository:
 					so.append("taxes", fee)
 
 			so.insert(ignore_permissions=True)
-			so.submit()
+			
+			if missing_hsn_found:
+				so.add_comment("Comment", "<b>[Action Required]</b> One or more items in this Sales Order are missing an HSN Code. Please update the Item master.")
+			
+			try:
+				so.submit()
+			except Exception as e:
+				frappe.log_error(title=f"Sales Order Submit Failed for {order_id}", message=frappe.get_traceback())
+				so.add_comment("Comment", f"<b>[Sync Error]</b> Failed to submit Sales Order automatically due to validation error: {e}")
+
+			if order.get("OrderStatus") == "Canceled":
+				self.handle_sales_order_cancellation(so, order)
 
 			return so.name
 
-	def get_orders(self, created_after) -> list:
+	def get_company_state_code(self, company: str) -> str:
+		company_gstin = frappe.db.get_value("Company", company, "gstin")
+		if company_gstin and len(company_gstin) >= 2 and company_gstin[:2].isdigit():
+			return company_gstin[:2]
+
+		addr_rows = frappe.db.sql(
+			"""
+			SELECT a.gst_state_number FROM `tabAddress` a
+			JOIN `tabDynamic Link` dl ON dl.parent = a.name
+			WHERE dl.link_doctype = 'Company' AND dl.link_name = %s AND a.gst_state_number IS NOT NULL
+			LIMIT 1
+			""",
+			(company,),
+			as_dict=True,
+		)
+		if addr_rows and addr_rows[0].gst_state_number:
+			return str(addr_rows[0].gst_state_number).zfill(2)
+		return ""
+
+	def get_product_gst_template(
+		self, item_code: str, company: str, is_inter_state: bool, order_item: dict | None = None
+	) -> str:
+		"""
+		Determines the Item Tax Template to apply for an item row.
+		Prefers the item's existing GST configuration (Item master, Item Group master, or SellerSKU item).
+		If no template is assigned, falls back to Amazon order item tax rate if available.
+		Raises ValidationError if no usable configuration is found.
+		"""
+		# 1. Check Item master taxes
+		if frappe.db.exists("Item", item_code):
+			item_doc = frappe.get_doc("Item", item_code)
+			for t in getattr(item_doc, "taxes", []):
+				t_disabled, t_company = frappe.get_cached_value(
+					"Item Tax Template", t.item_tax_template, ["disabled", "company"]
+				)
+				if not t_disabled and t_company == company:
+					cat = (t.tax_category or "").lower()
+					if is_inter_state and "in-state" not in cat:
+						return t.item_tax_template
+					elif not is_inter_state and "out-state" not in cat:
+						return t.item_tax_template
+
+			for t in getattr(item_doc, "taxes", []):
+				t_disabled, t_company = frappe.get_cached_value(
+					"Item Tax Template", t.item_tax_template, ["disabled", "company"]
+				)
+				if not t_disabled and t_company == company:
+					return t.item_tax_template
+
+			# 2. Check Item Group master taxes
+			if item_doc.item_group and frappe.db.exists("Item Group", item_doc.item_group):
+				ig_doc = frappe.get_doc("Item Group", item_doc.item_group)
+				for t in getattr(ig_doc, "taxes", []):
+					t_disabled, t_company = frappe.get_cached_value(
+						"Item Tax Template", t.item_tax_template, ["disabled", "company"]
+					)
+					if not t_disabled and t_company == company:
+						return t.item_tax_template
+
+		# 3. Check SellerSKU if different from item_code
+		if order_item and order_item.get("SellerSKU") and order_item.get("SellerSKU") != item_code:
+			sku = order_item.get("SellerSKU")
+			if frappe.db.exists("Item", sku):
+				sku_doc = frappe.get_doc("Item", sku)
+				for t in getattr(sku_doc, "taxes", []):
+					t_disabled, t_company = frappe.get_cached_value(
+						"Item Tax Template", t.item_tax_template, ["disabled", "company"]
+					)
+					if not t_disabled and t_company == company:
+						cat = (t.tax_category or "").lower()
+						if is_inter_state and "in-state" not in cat:
+							return t.item_tax_template
+						elif not is_inter_state and "out-state" not in cat:
+							return t.item_tax_template
+				for t in getattr(sku_doc, "taxes", []):
+					t_disabled, t_company = frappe.get_cached_value(
+						"Item Tax Template", t.item_tax_template, ["disabled", "company"]
+					)
+					if not t_disabled and t_company == company:
+						return t.item_tax_template
+
+		# 4. Infer from Amazon OrderItem tax rate if available
+		if order_item:
+			ip = float(order_item.get("ItemPrice", {}).get("Amount", 0) or 0)
+			it = float(order_item.get("ItemTax", {}).get("Amount", 0) or 0)
+			if ip > 0 and it > 0:
+				rate = round((it / ip) * 100)
+				candidate_templates = frappe.get_all(
+					"Item Tax Template",
+					filters={"company": company, "disabled": 0},
+					fields=["name", "title"],
+				)
+				prefix = "out-state" if is_inter_state else "in-state"
+				for tmpl in candidate_templates:
+					tmpl_name_lower = tmpl.name.lower()
+					if f"{rate}%" in tmpl_name_lower or f"{rate} %" in tmpl_name_lower:
+						if prefix in tmpl_name_lower:
+							return tmpl.name
+				for tmpl in candidate_templates:
+					tmpl_name_lower = tmpl.name.lower()
+					if f"{rate}%" in tmpl_name_lower or f"{rate} %" in tmpl_name_lower:
+						return tmpl.name
+
+		# 5. Not found -> raise ValidationError
+		frappe.throw(
+			_("No usable GST configuration found for item {0}.").format(item_code),
+			frappe.ValidationError,
+		)
+
+	def get_sales_taxes_and_charges_template(self, company: str, is_inter_state: bool) -> str:
+		company_abbr = frappe.db.get_value("Company", company, "abbr") or ""
+		keyword = "out-state" if is_inter_state else "in-state"
+
+		templates = frappe.get_all(
+			"Sales Taxes and Charges Template",
+			filters={"company": company, "disabled": 0},
+			fields=["name", "title", "is_default"],
+		)
+		for tmpl in templates:
+			name_lower = tmpl.name.lower()
+			if keyword in name_lower and "rcm" not in name_lower:
+				return tmpl.name
+
+		if is_inter_state:
+			expected = f"Output GST Out-state - {company_abbr}"
+		else:
+			expected = f"Output GST In-State - {company_abbr}"
+
+		if frappe.db.exists("Sales Taxes and Charges Template", expected):
+			return expected
+
+		if templates:
+			return templates[0].name
+
+		frappe.throw(
+			_("No Sales Taxes and Charges Template found for company {0}.").format(company),
+			frappe.ValidationError,
+		)
+
+	def create_sales_invoice(
+		self, sales_order_name: str, order: dict | None = None, order_items: list | None = None
+	) -> str:
+		"""
+		Creates and submits a Sales Invoice from an existing Sales Order using Amazon financial data.
+		- Idempotent: returns existing invoice if already created.
+		- Determines GST mode (Inter-state vs Intra-state) based on place of supply.
+		- Applies Amazon unit rates, promotion discounts, and shipping charges.
+		- Validates that amounts reconcile with Amazon OrderTotal.
+		"""
+		from erpnext.selling.doctype.sales_order.sales_order import make_sales_invoice
+
+		so = frappe.get_doc("Sales Order", sales_order_name)
+		amazon_order_id = so.amazon_order_id
+
+		# 1. Idempotency / Duplicate Check
+		existing_si = frappe.db.sql(
+			"""
+			SELECT parent FROM `tabSales Invoice Item`
+			WHERE sales_order = %s AND docstatus < 2
+			LIMIT 1
+			""",
+			(sales_order_name,),
+			as_dict=True,
+		)
+		if existing_si:
+			return existing_si[0].parent
+
+		if amazon_order_id:
+			existing_by_order = frappe.db.get_value(
+				"Sales Invoice",
+				filters={"custom_marketplace_order": amazon_order_id, "docstatus": ["<", 2]},
+				fieldname="name",
+			) or frappe.db.get_value(
+				"Sales Invoice",
+				filters={"po_no": amazon_order_id, "docstatus": ["<", 2]},
+				fieldname="name",
+			)
+			if existing_by_order:
+				return existing_by_order
+
+		# 2. Fetch Amazon order & order items if not provided
+		orders_client = self.get_orders_instance()
+		if not order and amazon_order_id:
+			ord_resp = orders_client.get_order(amazon_order_id)
+			order = ord_resp.get("payload", {})
+
+		if not order_items and amazon_order_id:
+			items_resp = orders_client.get_order_items(amazon_order_id)
+			order_items = items_resp.get("payload", {}).get("OrderItems", [])
+
+		# 3. Initialize Sales Invoice from Sales Order
+		si = make_sales_invoice(sales_order_name)
+		if amazon_order_id:
+			si.po_no = amazon_order_id
+			if hasattr(si, "custom_marketplace_order"):
+				si.custom_marketplace_order = amazon_order_id
+		if order and hasattr(si, "amazon_is_business_order"):
+			si.amazon_is_business_order = 1 if order.get("IsBusinessOrder") else 0
+
+		# 4. Determine GST Mode: Inter-State vs Intra-State
+		company_state_code = self.get_company_state_code(si.company)
+		pos = so.place_of_supply or getattr(si, "place_of_supply", None)
+		pos_code = pos.split("-")[0].strip() if pos and "-" in pos else ""
+		is_inter_state = bool(pos_code and company_state_code and pos_code != company_state_code)
+
+		# 5. Set Taxes & Charges Template
+		si.taxes_and_charges = self.get_sales_taxes_and_charges_template(si.company, is_inter_state)
+		si.set_taxes()
+
+		# Map Amazon items by ASIN and SellerSKU
+		amz_items_map = {}
+		if order_items:
+			for itm in order_items:
+				if itm.get("ASIN"):
+					amz_items_map[itm.get("ASIN")] = itm
+				if itm.get("SellerSKU"):
+					amz_items_map[itm.get("SellerSKU")] = itm
+
+		primary_tax_template = None
+
+		for row in list(si.items):
+			matched_amz_item = amz_items_map.get(row.item_code)
+			if not matched_amz_item and order_items and len(order_items) == 1:
+				matched_amz_item = order_items[0]
+
+			qty = float(matched_amz_item.get("QuantityOrdered") if matched_amz_item else row.qty or 1)
+			row.qty = qty
+
+			if matched_amz_item:
+				ip = float(matched_amz_item.get("ItemPrice", {}).get("Amount", 0) or 0)
+				promo = float(matched_amz_item.get("PromotionDiscount", {}).get("Amount", 0) or 0)
+
+				if promo > 0:
+					row.price_list_rate = ip / qty
+					row.discount_amount = promo / qty
+					row.rate = (ip - promo) / qty
+				else:
+					row.rate = ip / qty
+
+			item_tax_template = self.get_product_gst_template(
+				row.item_code, si.company, is_inter_state, order_item=matched_amz_item
+			)
+			row.item_tax_template = item_tax_template
+			if not primary_tax_template:
+				primary_tax_template = item_tax_template
+
+		# 6. Add Shipping Charges item if ShippingPrice > 0
+		total_shipping_price = 0.0
+		if order_items:
+			total_shipping_price = sum(
+				float(itm.get("ShippingPrice", {}).get("Amount", 0) or 0) for itm in order_items
+			)
+
+		if total_shipping_price > 0:
+			shipping_item_code = "Shipping Charges"
+			if not frappe.db.exists("Item", shipping_item_code):
+				frappe.throw(
+					_("Item '{0}' not found for shipping charges.").format(shipping_item_code),
+					frappe.ValidationError,
+				)
+
+			shipping_income_account = (
+				frappe.db.get_value(
+					"Item Default",
+					filters={"parent": shipping_item_code, "company": si.company},
+					fieldname="income_account",
+				)
+				or frappe.db.get_value("Account", {"company": si.company, "account_name": "Shipping Charges"}, "name")
+				or f"Shipping Charges - {frappe.db.get_value('Company', si.company, 'abbr')}"
+			)
+			if not frappe.db.exists("Account", shipping_income_account):
+				shipping_income_account = frappe.get_cached_value("Company", si.company, "default_income_account")
+
+			si.append(
+				"items",
+				{
+					"item_code": shipping_item_code,
+					"item_name": "Shipping Charges",
+					"description": f"Shipping Charges for Amazon Order {amazon_order_id}",
+					"qty": 1.0,
+					"rate": total_shipping_price,
+					"uom": "Nos",
+					"stock_uom": "Nos",
+					"conversion_factor": 1.0,
+					"item_tax_template": primary_tax_template,
+					"income_account": shipping_income_account,
+				},
+			)
+
+		# 7. Calculate taxes and totals
+		si.run_method("calculate_taxes_and_totals")
+
+		# 8. Amount Reconciliation check if OrderTotal provided
+		if order and order.get("OrderTotal", {}).get("Amount"):
+			amz_total = float(order.get("OrderTotal", {}).get("Amount"))
+			diff = abs(si.grand_total - amz_total)
+			if diff > 1.0:
+				frappe.throw(
+					_("Sales Invoice grand total {0} does not reconcile with Amazon OrderTotal {1} (difference: {2}).").format(
+						si.grand_total, amz_total, diff
+					),
+					frappe.ValidationError,
+				)
+
+		# 9. Insert and Submit
+		si.update_stock = 0
+		si.insert(ignore_permissions=True)
+		si.submit()
+
+		return si.name
+
+	def get_orders(self, created_after: str | None = None, last_updated_after: str | None = None) -> list:
 		orders = self.get_orders_instance()
 		order_statuses = [
 			"PendingAvailability",
@@ -597,27 +1217,34 @@ class AmazonRepository:
 			"Canceled",
 			"Unfulfillable",
 		]
-		fulfillment_channels = ["FBA", "SellerFulfilled"]
+		fulfillment_channels = ["AFN", "MFN"]
+
+		kwargs = {
+			"order_statuses": order_statuses,
+			"fulfillment_channels": fulfillment_channels,
+			"max_results": 50,
+		}
+		if created_after:
+			kwargs["created_after"] = created_after
+		if last_updated_after:
+			kwargs["last_updated_after"] = last_updated_after
 
 		orders_payload = self.call_sp_api_method(
 			sp_api_method=orders.get_orders,
-			created_after=created_after,
-			order_statuses=order_statuses,
-			fulfillment_channels=fulfillment_channels,
-			max_results=50,
+			**kwargs,
 		)
 
 		sales_orders = []
 
 		while True:
-			orders_list = orders_payload.get("Orders")
-			next_token = orders_payload.get("NextToken")
+			orders_list = (orders_payload or {}).get("Orders")
+			next_token = (orders_payload or {}).get("NextToken")
 
 			if not orders_list or len(orders_list) == 0:
 				break
 
 			for order in orders_list:
-				sales_order = self.create_sales_order(order)
+				sales_order, *_ = self.sync_order(order)
 				if sales_order:
 					sales_orders.append(sales_order)
 
@@ -627,6 +1254,7 @@ class AmazonRepository:
 			orders_payload = self.call_sp_api_method(
 				sp_api_method=orders.get_orders,
 				created_after=created_after,
+				last_updated_after=last_updated_after,
 				next_token=next_token,
 			)
 
@@ -734,6 +1362,703 @@ class AmazonRepository:
 		return None
 
 
+	# ── Phase 4 Payment Entry ────────────────────────────────────────────────
+
+	_AMAZON_PAYMENT_METHOD_MAP: dict = {
+		# key is lowercased PaymentMethod string from Amazon
+		"cod": "Cash",
+		"cashondelivery": "Cash",
+		"cash on delivery": "Cash",
+		"cash": "Cash",
+		"standard": "Cash",
+		"other": "Cash",
+		"amazon": "Cash",
+		"amazon pay": "Cash",
+		"upi": "Cash",
+		"creditcard": "Credit Card",
+		"credit card": "Credit Card",
+		"netbanking": "Wire Transfer",
+		"neft": "Wire Transfer",
+		"wire transfer": "Wire Transfer",
+		"cheque": "Cheque",
+	}
+
+	def get_amazon_mode_of_payment(self, payment_method: str | None) -> str:
+		"""
+		Maps an Amazon PaymentMethod string to an ERPNext Mode of Payment name.
+		Defaults to 'Cash' if method is not mapped.
+		"""
+		if not payment_method:
+			return "Cash"
+		key = payment_method.strip().lower()
+		# Handle PaymentMethodDetails list serialised as comma-joined string
+		if "," in key:
+			for part in key.split(","):
+				result = self._AMAZON_PAYMENT_METHOD_MAP.get(part.strip())
+				if result:
+					return result
+			return "Cash"
+		return self._AMAZON_PAYMENT_METHOD_MAP.get(key, "Cash")
+
+	def create_payment_entry(
+		self,
+		sales_invoice_name: str,
+		payment_method: str | None = None,
+		payment_status: dict | None = None,
+	) -> str | None:
+		"""
+		Creates and submits a standard ERPNext Payment Entry (Receive) against a
+		Sales Invoice from an Amazon order.
+
+		- Idempotent: returns existing submitted/draft PE if one already exists.
+		- Payment confirmation and amount come from Amazon Finances (2024-06-19).
+		- Customer sales breakdown amount is used (never deducted by Amazon seller fees).
+		- Returns the PE name on success, or None.
+		"""
+		si = frappe.get_doc("Sales Invoice", sales_invoice_name)
+
+		if si.docstatus != 1:
+			frappe.throw(
+				_("Cannot create Payment Entry against Sales Invoice {0}: not submitted (docstatus={1}).").format(
+					sales_invoice_name, si.docstatus
+				),
+				frappe.ValidationError,
+			)
+
+		# 1. Idempotency: check for existing PE against this invoice
+		existing_pe = frappe.db.sql(
+			"""
+			SELECT per.parent
+			FROM `tabPayment Entry Reference` per
+			JOIN `tabPayment Entry` pe ON pe.name = per.parent
+			WHERE per.reference_doctype = 'Sales Invoice'
+			  AND per.reference_name = %s
+			  AND pe.docstatus < 2
+			LIMIT 1
+			""",
+			(sales_invoice_name,),
+			as_dict=True,
+		)
+		if existing_pe:
+			return existing_pe[0].parent
+
+		# 2. Check outstanding amount
+		if si.outstanding_amount is not None:
+			outstanding = float(si.outstanding_amount)
+		else:
+			outstanding = float(si.rounded_total or si.grand_total or 0)
+		if outstanding <= 0:
+			frappe.log_error(
+				message=f"Sales Invoice {sales_invoice_name} has outstanding_amount={outstanding}. No payment entry created.",
+				title="Amazon Payment Entry: invoice already paid",
+			)
+			return None
+
+		# 3. Resolve payment method from the invoice's Sales Order if not provided
+		if not payment_method:
+			so_name = frappe.db.get_value(
+				"Sales Invoice Item",
+				{"parent": sales_invoice_name, "sales_order": ["like", "SAL-%"]},
+				"sales_order",
+			)
+			if so_name:
+				payment_method = frappe.db.get_value("Sales Order", so_name, "amazon_payment_method")
+
+		# If payment_status is not provided and payment_method is not COD, skip PE
+		if not payment_status:
+			if payment_method and payment_method.strip().lower() not in (
+				"cod",
+				"cashondelivery",
+				"cash on delivery",
+				"cash",
+			):
+				frappe.log_error(
+					message=(
+						f"Skipping Payment Entry for Sales Invoice {sales_invoice_name}: "
+						f"Amazon PaymentMethod '{payment_method}' requires financial settlement confirmation."
+					),
+					title="Amazon Payment Entry: payment confirmation required",
+				)
+				return None
+
+		# 4. Map to ERPNext Mode of Payment and resolve accounts
+		mode_of_payment = self.get_amazon_mode_of_payment(payment_method) or "Cash"
+
+		paid_to = frappe.db.get_value(
+			"Mode of Payment Account",
+			{"parent": mode_of_payment, "company": si.company},
+			"default_account",
+		)
+		if not paid_to:
+			# Fallback to configured Mode of Payment Account for this company
+			fallback_mop_acc = frappe.db.get_value(
+				"Mode of Payment Account",
+				{"company": si.company},
+				["parent", "default_account"],
+				as_dict=True,
+			)
+			if fallback_mop_acc:
+				mode_of_payment = fallback_mop_acc.parent
+				paid_to = fallback_mop_acc.default_account
+			else:
+				# Fallback to default cash account of company
+				paid_to = (
+					frappe.db.get_value("Company", si.company, "default_cash_account")
+					or frappe.db.get_value("Account", {"account_type": "Cash", "company": si.company}, "name")
+					or frappe.db.get_value("Account", {"account_name": ["like", "%Cash%"], "company": si.company}, "name")
+				)
+
+		if not paid_to:
+			frappe.throw(
+				_("No account configured for Mode of Payment '{0}' and Company '{1}'.").format(
+					mode_of_payment, si.company
+				),
+				frappe.ValidationError,
+			)
+
+		# 5. paid_from = company default receivable account
+		paid_from = (
+			frappe.db.get_value("Company", si.company, "default_receivable_account")
+			or frappe.db.get_value("Account", {"account_type": "Receivable", "company": si.company}, "name")
+		)
+		if not paid_from:
+			frappe.throw(
+				_("No default receivable account found for Company '{0}'.").format(si.company),
+				frappe.ValidationError,
+			)
+
+		# 6. Amount determination:
+		# Use payment_status amount (customer sales breakdown amount) if available, capped at outstanding
+		if payment_status and payment_status.get("amount") and float(payment_status["amount"]) > 0:
+			pay_amount = min(float(payment_status["amount"]), outstanding)
+		else:
+			pay_amount = outstanding
+
+		# 7. Build Payment Entry
+		pe = frappe.new_doc("Payment Entry")
+		pe.payment_type = "Receive"
+		pe.party_type = "Customer"
+		pe.party = si.customer
+		pe.company = si.company
+		pe.posting_date = frappe.utils.nowdate()
+		pe.mode_of_payment = mode_of_payment
+		pe.paid_from = paid_from
+		pe.paid_to = paid_to
+		pe.paid_amount = pay_amount
+		pe.received_amount = pay_amount
+		pe.reference_no = si.po_no or sales_invoice_name
+		pe.reference_date = pe.posting_date
+
+		pe.append(
+			"references",
+			{
+				"reference_doctype": "Sales Invoice",
+				"reference_name": sales_invoice_name,
+				"allocated_amount": pay_amount,
+				"total_amount": outstanding,
+				"outstanding_amount": outstanding,
+			},
+		)
+
+		pe.insert(ignore_permissions=True)
+		pe.submit()
+
+		return pe.name
+
+	def sync_sales_order_invoice_and_payment(
+		self, sales_order_name: str, order: dict | None = None, order_items: list | None = None
+	) -> tuple[str | None, str | None]:
+		"""
+		Handles automatic Sales Invoice and Payment Entry creation for a Sales Order:
+		1. If order is Canceled or Sales Order is not submitted (docstatus != 1), skip invoice.
+		2. Idempotently creates or retrieves existing Sales Invoice via self.create_sales_invoice().
+		3. Checks authoritative financial settlement via Finances API v2024-06-19.
+		4. If payment is confirmed (RELEASED / DEFERRED_RELEASED), creates or retrieves Payment Entry.
+		5. If DEFERRED or no qualifying transaction, leaves Sales Invoice Outstanding.
+		Returns (sales_invoice_name, payment_entry_name).
+		"""
+		if not sales_order_name:
+			return None, None
+
+		# Check order status
+		order_status = None
+		if order:
+			order_status = order.get("OrderStatus")
+		if not order_status:
+			order_status = frappe.db.get_value("Sales Order", sales_order_name, "amazon_order_status")
+
+		if order_status == "Canceled":
+			return None, None
+
+		# Check Sales Order docstatus (must be submitted)
+		so_docstatus = frappe.db.get_value("Sales Order", sales_order_name, "docstatus")
+		if so_docstatus != 1:
+			return None, None
+
+		si_name = None
+		pe_name = None
+
+		try:
+			si_name = self.create_sales_invoice(sales_order_name, order=order, order_items=order_items)
+		except Exception as e:
+			import traceback
+			traceback.print_exc()
+			frappe.log_error(
+				title=f"Failed to create Sales Invoice for {sales_order_name}",
+				message=frappe.get_traceback(),
+				reference_doctype="Sales Order",
+				reference_name=sales_order_name,
+			)
+			return None, None
+
+		if not si_name:
+			return None, None
+
+		# Check authoritative payment status from Finances 2024-06-19
+		amazon_order_id = (order.get("AmazonOrderId") if order else None) or frappe.db.get_value(
+			"Sales Order", sales_order_name, "amazon_order_id"
+		)
+		if amazon_order_id:
+			try:
+				payment_status = self.get_amazon_payment_status(amazon_order_id)
+				if payment_status.get("confirmed"):
+					pm = (order.get("PaymentMethod") if order else None) or frappe.db.get_value(
+						"Sales Order", sales_order_name, "amazon_payment_method"
+					)
+					pe_name = self.create_payment_entry(
+						si_name, payment_method=pm, payment_status=payment_status
+					)
+				else:
+					# DEFERRED or no qualifying transaction: leave Sales Invoice Outstanding
+					pe_name = None
+			except Exception as e:
+				frappe.log_error(
+					title=f"Failed to process Payment Entry for {sales_order_name}",
+					message=frappe.get_traceback(),
+					reference_doctype="Sales Order",
+					reference_name=sales_order_name,
+				)
+				pe_name = None
+
+		return si_name, pe_name
+
+	def get_amazon_shipment_status(
+		self, order: dict, order_items: list | None = None
+	) -> dict:
+		"""
+		Determines Amazon shipment fulfillment status based on QuantityShipped from order items.
+		Returns:
+		{
+			"has_shipped_quantity": bool,
+			"total_shipped_qty": int,
+			"items": [
+				{
+					"order_item_id": str,
+					"seller_sku": str,
+					"asin": str,
+					"qty_ordered": int,
+					"qty_shipped": int,
+				}
+			]
+		}
+		"""
+		order_id = order.get("AmazonOrderId") if order else None
+		if not order_items and order_id:
+			try:
+				orders_client = self.get_orders_instance()
+				items_resp = orders_client.get_order_items(order_id)
+				order_items = (items_resp.get("payload") or {}).get("OrderItems", [])
+			except Exception as e:
+				frappe.log_error(
+					title=f"Amazon shipment check failed for order {order_id}",
+					message=frappe.get_traceback(),
+				)
+				return {
+					"has_shipped_quantity": False,
+					"total_shipped_qty": 0,
+					"items": [],
+					"error": str(e),
+				}
+
+		items_list = []
+		total_shipped = 0
+		for itm in (order_items or []):
+			qty_shipped = int(itm.get("QuantityShipped") or 0)
+			qty_ordered = int(itm.get("QuantityOrdered") or 0)
+			total_shipped += qty_shipped
+			items_list.append(
+				{
+					"order_item_id": itm.get("OrderItemId"),
+					"seller_sku": itm.get("SellerSKU"),
+					"asin": itm.get("ASIN"),
+					"qty_ordered": qty_ordered,
+					"qty_shipped": qty_shipped,
+				}
+			)
+
+		return {
+			"has_shipped_quantity": total_shipped > 0,
+			"total_shipped_qty": total_shipped,
+			"items": items_list,
+		}
+
+	def create_delivery_note(
+		self,
+		sales_order_name: str,
+		order: dict | None = None,
+		order_items: list | None = None,
+		shipment_status: dict | None = None,
+	) -> str | None:
+		"""
+		Creates and submits a Delivery Note for a Sales Order based on Amazon QuantityShipped.
+		- Only creates DN if Amazon QuantityShipped > 0.
+		- Supports partial shipments and incremental deliveries.
+		- Idempotent: Never duplicates previously delivered quantities.
+		- If all shipped quantities are already delivered, returns None.
+		- Preserves cancellation safety: returns None for canceled orders.
+		"""
+		if not sales_order_name:
+			print("DEBUG: early return 1")
+			return None
+
+		so = frappe.get_doc("Sales Order", sales_order_name)
+		if so.docstatus != 1 or so.status == "Cancelled":
+			print(f"DEBUG: early return 2. so.docstatus={so.docstatus}, so.status={so.status}")
+			return None
+
+		if order and order.get("OrderStatus") == "Canceled":
+			print("DEBUG: early return 3")
+			return None
+
+		from frappe.utils import flt
+		if flt(so.per_delivered) >= 100:
+			print("DEBUG: early return 4")
+			return None
+
+		frappe.db.sql("SELECT name FROM `tabSales Order` WHERE name = %s FOR UPDATE", (sales_order_name,))
+
+		# 1. Fetch shipment status if not provided
+		if shipment_status is None:
+			shipment_status = self.get_amazon_shipment_status(order, order_items=order_items)
+		print(f"DEBUG: shipment_status={shipment_status}")
+
+		if not shipment_status.get("has_shipped_quantity"):
+			return None
+
+		# Map Amazon shipped quantities by SellerSKU and ASIN / OrderItemId
+		amz_items = shipment_status.get("items", [])
+		amz_by_sku = {i["seller_sku"]: i for i in amz_items if i.get("seller_sku")}
+		amz_by_code = {i["asin"]: i for i in amz_items if i.get("asin")}
+
+		# 2. Build initial Delivery Note from Sales Order
+		print(f"DEBUG: calling make_delivery_note({sales_order_name}). Sales Order has {len(so.items)} items.")
+		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
+		dn = make_delivery_note(sales_order_name)
+		print(f"DEBUG: dn items before filter: {len(dn.items)}")
+
+		amazon_order_id = (order.get("AmazonOrderId") if order else None) or so.amazon_order_id
+
+		items_to_keep = []
+		for dn_item in list(dn.items):
+			# Match to Amazon item
+			amz_item = (
+				amz_by_sku.get(dn_item.item_name)
+				or amz_by_code.get(dn_item.item_code)
+				or (amz_items[0] if len(amz_items) == 1 else None)
+			)
+			amz_shipped = int((amz_item or {}).get("qty_shipped") or 0)
+			print(f"DEBUG: amz_item={amz_item}, amz_shipped={amz_shipped}")
+
+			# Query already delivered quantity for this Sales Order item
+			already_delivered = flt(
+				frappe.db.sql(
+					"""
+					SELECT COALESCE(SUM(dni.qty), 0)
+					FROM `tabDelivery Note Item` dni
+					JOIN `tabDelivery Note` dn_parent ON dn_parent.name = dni.parent
+					WHERE dni.so_detail = %s
+					  AND dn_parent.docstatus < 2
+					  AND dn_parent.is_return = 0
+					""",
+					(dn_item.so_detail,),
+				)[0][0]
+			)
+
+			so_qty = flt(frappe.db.get_value("Sales Order Item", dn_item.so_detail, "qty") or dn_item.qty)
+			to_deliver = min(flt(amz_shipped) - already_delivered, so_qty - already_delivered)
+
+			# Log per requested format
+			frappe.logger("ecommerce_integrations").info(
+				f"Amazon shipment check:\n"
+				f"Order: {amazon_order_id}\n"
+				f"Amazon shipped quantity: {amz_shipped}\n"
+				f"ERPNext delivered quantity: {already_delivered}\n"
+				f"Remaining quantity: {max(0, to_deliver)}"
+			)
+
+			if to_deliver > 0:
+				dn_item.qty = to_deliver
+				dn_item.allow_zero_valuation_rate = 1
+				if not dn_item.warehouse:
+					dn_item.warehouse = self.amz_setting.warehouse
+				items_to_keep.append(dn_item)
+
+		if not items_to_keep:
+			print("DEBUG: items_to_keep is empty. Returning None")
+			return None
+
+		dn.items = items_to_keep
+		if amazon_order_id:
+			dn.po_no = amazon_order_id
+			if hasattr(dn, "custom_marketplace_order"):
+				dn.custom_marketplace_order = amazon_order_id
+
+		dn.run_method("set_missing_values")
+		dn.run_method("calculate_taxes_and_totals")
+		dn.insert(ignore_permissions=True)
+		dn.submit()
+
+		return dn.name
+
+	def sync_order(self, order: dict) -> tuple[str | None, str | None, str | None, str | None]:
+		"""
+		Synchronizes a single Amazon order:
+		Amazon Order -> Sales Order -> Sales Invoice -> Delivery Note (if QuantityShipped > 0).
+		Payment Entry requires confirmed financial settlement (otherwise SI remains Outstanding).
+		Returns (sales_order_name, sales_invoice_name, payment_entry_name, delivery_note_name).
+		"""
+		try:
+			sales_order = self.create_sales_order(order)
+			if not sales_order:
+				return None, None, None, None
+
+			si_name, pe_name = self.sync_sales_order_invoice_and_payment(sales_order, order=order)
+
+			dn_name = None
+			so_docstatus = frappe.db.get_value("Sales Order", sales_order, "docstatus")
+			if so_docstatus == 1 and order.get("OrderStatus") != "Canceled":
+				try:
+					dn_name = self.create_delivery_note(sales_order, order=order)
+				except Exception as e:
+					print(f"DEBUG: Exception in create_delivery_note: {frappe.get_traceback()}")
+					frappe.log_error(
+						title=f"Failed to create Delivery Note for {sales_order}",
+						message=frappe.get_traceback(),
+						reference_doctype="Sales Order",
+						reference_name=sales_order,
+					)
+				
+				try:
+					self.handle_returns(sales_order, order)
+				except Exception as e:
+					frappe.log_error(
+						title=f"Failed to handle returns for {sales_order}",
+						message=frappe.get_traceback(),
+						reference_doctype="Sales Order",
+						reference_name=sales_order,
+					)
+
+			return sales_order, si_name, pe_name, dn_name
+		except Exception as e:
+			amazon_order_id = order.get("AmazonOrderId")
+			frappe.log_error(
+				title=f"Amazon Sync Failed for Order {amazon_order_id}",
+				message=frappe.get_traceback()
+			)
+			return None, None, None, None
+
+	def get_refund_events(self, order_id: str) -> list:
+		finances = self.get_finances_instance()
+		next_token = None
+		refund_events = []
+
+		while True:
+			try:
+				payload = self.call_sp_api_method(
+					sp_api_method=finances.list_financial_events_by_order_id,
+					order_id=order_id,
+					next_token=next_token,
+				)
+			except Exception:
+				break
+
+			events = payload.get("FinancialEvents", {}) if isinstance(payload, dict) else {}
+			refunds = events.get("RefundEventList", [])
+			if refunds:
+				refund_events.extend(refunds)
+
+			next_token = payload.get("NextToken") if isinstance(payload, dict) else None
+			if not next_token:
+				break
+
+		return refund_events
+
+	def handle_returns(self, sales_order_name: str, order: dict) -> None:
+		so_docstatus = frappe.db.get_value("Sales Order", sales_order_name, "docstatus")
+		if so_docstatus != 1 or order.get("OrderStatus") == "Canceled":
+			return
+
+		order_id = order.get("AmazonOrderId")
+		if not order_id:
+			return
+
+		refund_events = self.get_refund_events(order_id)
+		if not refund_events:
+			return
+
+		from frappe.utils import flt
+		amz_returns = {}
+		for event in refund_events:
+			for adj in event.get("ShipmentItemAdjustmentList", []):
+				sku = adj.get("SellerSKU")
+				qty = flt(adj.get("QuantityShipped"))
+				if sku and qty > 0:
+					amz_returns[sku] = amz_returns.get(sku, 0.0) + qty
+
+		if not amz_returns:
+			return
+
+		# Idempotency checks
+		returned_qty_data = frappe.db.sql("""
+			SELECT item_code, SUM(ABS(qty)) as returned_qty 
+			FROM `tabDelivery Note Item` 
+			WHERE against_sales_order = %s AND docstatus < 2 AND parent IN (
+				SELECT name FROM `tabDelivery Note` WHERE is_return = 1
+			)
+			GROUP BY item_code
+		""", (sales_order_name,), as_dict=True)
+		erpnext_returns = {d.item_code: flt(d.returned_qty) for d in returned_qty_data}
+
+		so_items = frappe.db.sql("""
+			SELECT item_code, item_name 
+			FROM `tabSales Order Item` 
+			WHERE parent = %s
+		""", (sales_order_name,), as_dict=True)
+		sku_to_item = {d.item_name: d.item_code for d in so_items if d.item_name}
+
+		incremental_returns = {}
+		for sku, amz_qty in amz_returns.items():
+			item_code = sku_to_item.get(sku)
+			if not item_code:
+				continue
+			already_returned = erpnext_returns.get(item_code, 0.0)
+			if amz_qty > already_returned:
+				incremental_returns[item_code] = amz_qty - already_returned
+
+		if incremental_returns:
+			original_dns = frappe.db.sql("""
+				SELECT DISTINCT parent 
+				FROM `tabDelivery Note Item` 
+				WHERE against_sales_order = %s AND docstatus = 1 AND parent IN (
+					SELECT name FROM `tabDelivery Note` WHERE is_return = 0
+				)
+				ORDER BY creation DESC
+			""", (sales_order_name,))
+
+			if original_dns:
+				original_dn_name = original_dns[0][0]
+				from erpnext.stock.doctype.delivery_note.delivery_note import make_sales_return as make_dn_return
+				dn_return = make_dn_return(original_dn_name)
+				items_to_keep = []
+				for item in dn_return.items:
+					if item.item_code in incremental_returns and incremental_returns[item.item_code] > 0:
+						inc_qty = incremental_returns[item.item_code]
+						max_allowed_abs = abs(item.qty)
+						
+						if inc_qty > max_allowed_abs:
+							item.qty = -max_allowed_abs
+							incremental_returns[item.item_code] -= max_allowed_abs
+						else:
+							item.qty = -inc_qty
+							incremental_returns[item.item_code] = 0.0
+						
+						items_to_keep.append(item)
+				
+				dn_return.items = items_to_keep
+				if original_dn_name:
+					orig_po = frappe.db.get_value("Delivery Note", original_dn_name, "po_no")
+					if orig_po:
+						dn_return.po_no = orig_po
+					orig_cmo = frappe.db.get_value("Delivery Note", original_dn_name, "custom_marketplace_order")
+					if orig_cmo and hasattr(dn_return, "custom_marketplace_order"):
+						dn_return.custom_marketplace_order = orig_cmo
+				if dn_return.items:
+					dn_return.flags.ignore_permissions = True
+					dn_return.insert()
+					dn_return.submit()
+
+		returned_si_data = frappe.db.sql("""
+			SELECT item_code, SUM(ABS(qty)) as returned_qty 
+			FROM `tabSales Invoice Item` 
+			WHERE sales_order = %s AND docstatus < 2 AND parent IN (
+				SELECT name FROM `tabSales Invoice` WHERE is_return = 1
+			)
+			GROUP BY item_code
+		""", (sales_order_name,), as_dict=True)
+		erpnext_si_returns = {d.item_code: flt(d.returned_qty) for d in returned_si_data}
+
+		incremental_returns_si = {}
+		for sku, amz_qty in amz_returns.items():
+			item_code = sku_to_item.get(sku)
+			if not item_code:
+				continue
+			already_returned = erpnext_si_returns.get(item_code, 0.0)
+			if amz_qty > already_returned:
+				incremental_returns_si[item_code] = amz_qty - already_returned
+
+		if incremental_returns_si:
+			print(f"DEBUG: incremental_returns_si={incremental_returns_si}")
+			original_sis = frappe.db.sql("""
+				SELECT DISTINCT parent 
+				FROM `tabSales Invoice Item` 
+				WHERE sales_order = %s AND docstatus = 1 AND parent IN (
+					SELECT name FROM `tabSales Invoice` WHERE is_return = 0
+				)
+				ORDER BY creation DESC
+			""", (sales_order_name,))
+
+			if original_sis:
+				original_si_name = original_sis[0][0]
+				from erpnext.accounts.doctype.sales_invoice.sales_invoice import make_sales_return as make_si_return
+				si_return = make_si_return(original_si_name)
+				si_return.update_stock = 0
+				items_to_keep = []
+				for item in si_return.items:
+					if item.item_code in incremental_returns_si and incremental_returns_si[item.item_code] > 0:
+						inc_qty = incremental_returns_si[item.item_code]
+						max_allowed_abs = abs(item.qty)
+						
+						if inc_qty > max_allowed_abs:
+							item.qty = -max_allowed_abs
+							incremental_returns_si[item.item_code] -= max_allowed_abs
+						else:
+							item.qty = -inc_qty
+							incremental_returns_si[item.item_code] = 0.0
+							
+						items_to_keep.append(item)
+				
+				print(f"DEBUG: si items_to_keep={len(items_to_keep)}")
+				si_return.items = items_to_keep
+				if original_si_name:
+					orig_po = frappe.db.get_value("Sales Invoice", original_si_name, "po_no")
+					if orig_po:
+						si_return.po_no = orig_po
+					orig_cmo = frappe.db.get_value("Sales Invoice", original_si_name, "custom_marketplace_order")
+					if orig_cmo and hasattr(si_return, "custom_marketplace_order"):
+						si_return.custom_marketplace_order = orig_cmo
+				if si_return.items:
+					si_return.flags.ignore_permissions = True
+					try:
+						si_return.insert()
+						si_return.submit()
+						print(f"DEBUG: SI RETURN CREATED {si_return.name}")
+					except Exception as e:
+						import traceback
+						traceback.print_exc()
+						frappe.log_error(title="SI Return Failed", message=frappe.get_traceback())
+
+
+
 def validate_amazon_sp_api_credentials(**args) -> None:
 	api = SPAPI(
 		client_id=args.get("client_id"),
@@ -751,6 +2076,60 @@ def validate_amazon_sp_api_credentials(**args) -> None:
 		frappe.throw(msg)
 
 
-def get_orders(amz_setting_name, created_after) -> list:
+def get_orders(amz_setting_name, created_after=None, last_updated_after=None) -> list:
 	ar = AmazonRepository(amz_setting_name)
-	return ar.get_orders(created_after)
+	return ar.get_orders(created_after=created_after, last_updated_after=last_updated_after)
+
+
+def create_sales_invoice(amz_setting_name: str, sales_order_name: str, order: dict | None = None, order_items: list | None = None) -> str:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.create_sales_invoice(sales_order_name, order=order, order_items=order_items)
+
+
+def get_amazon_payment_status(amz_setting_name: str, order_id: str) -> dict:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.get_amazon_payment_status(order_id)
+
+
+def create_payment_entry(
+	amz_setting_name: str,
+	sales_invoice_name: str,
+	payment_method: str | None = None,
+	payment_status: dict | None = None,
+) -> str | None:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.create_payment_entry(sales_invoice_name, payment_method=payment_method, payment_status=payment_status)
+
+
+def sync_sales_order_invoice_and_payment(
+	amz_setting_name: str, sales_order_name: str, order: dict | None = None, order_items: list | None = None
+) -> tuple[str | None, str | None]:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.sync_sales_order_invoice_and_payment(sales_order_name, order=order, order_items=order_items)
+
+
+def get_amazon_shipment_status(amz_setting_name: str, order: dict, order_items: list | None = None) -> dict:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.get_amazon_shipment_status(order, order_items=order_items)
+
+
+def create_delivery_note(
+	amz_setting_name: str,
+	sales_order_name: str,
+	order: dict | None = None,
+	order_items: list | None = None,
+	shipment_status: dict | None = None,
+) -> str | None:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.create_delivery_note(sales_order_name, order=order, order_items=order_items, shipment_status=shipment_status)
+
+
+def sync_order(amz_setting_name: str, order: dict) -> tuple[str | None, str | None, str | None, str | None]:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.sync_order(order)
+
+
+def create_customer(amz_setting_name: str, order: dict) -> str:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.create_customer(order)
+

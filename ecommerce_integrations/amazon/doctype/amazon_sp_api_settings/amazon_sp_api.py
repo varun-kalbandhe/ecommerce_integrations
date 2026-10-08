@@ -137,6 +137,39 @@ class SPAPI:
 			for idx in range(len(values)):
 				data[f"{key}[{idx}]"] = values[idx]
 
+	def list_to_comma_str(self, key: str, values: list | str | None, data: dict) -> None:
+		if values:
+			if isinstance(values, list):
+				val_str = ",".join(str(v) for v in values if v is not None and str(v).strip())
+				if val_str:
+					data[key] = val_str
+			elif isinstance(values, str) and values.strip():
+				data[key] = values.strip()
+
+
+class FinancesV20240619(SPAPI):
+	"""Amazon Finances API v2024-06-19"""
+
+	BASE_URI = "/finances/2024-06-19/"
+
+	def list_transactions(
+		self,
+		related_identifier_name: str | None = None,
+		related_identifier_value: str | None = None,
+		posted_after: str | None = None,
+		posted_before: str | None = None,
+		next_token: str | None = None,
+	) -> dict:
+		"""Returns transactions filtered by identifier (e.g. ORDER_ID) or date range."""
+		data = dict(
+			relatedIdentifierName=related_identifier_name,
+			relatedIdentifierValue=related_identifier_value,
+			postedAfter=posted_after,
+			postedBefore=posted_before,
+			nextToken=next_token,
+		)
+		return self.make_request(append_to_base_uri="transactions", params=data)
+
 
 class Finances(SPAPI):
 	"""Amazon Finances API"""
@@ -151,6 +184,28 @@ class Finances(SPAPI):
 		data = dict(MaxResultsPerPage=max_results, NextToken=next_token)
 		return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
 
+	def list_transactions(
+		self,
+		related_identifier_name: str | None = None,
+		related_identifier_value: str | None = None,
+		posted_after: str | None = None,
+		posted_before: str | None = None,
+		next_token: str | None = None,
+	) -> dict:
+		v2024 = FinancesV20240619(
+			client_id=self.client_id,
+			client_secret=self.client_secret,
+			refresh_token=self.refresh_token,
+			country_code=self.country_code,
+		)
+		return v2024.list_transactions(
+			related_identifier_name=related_identifier_name,
+			related_identifier_value=related_identifier_value,
+			posted_after=posted_after,
+			posted_before=posted_before,
+			next_token=next_token,
+		)
+
 
 class Orders(SPAPI):
 	"""Amazon Orders API"""
@@ -159,20 +214,20 @@ class Orders(SPAPI):
 
 	def get_orders(
 		self,
-		created_after: str,
+		created_after: str | None = None,
 		created_before: str | None = None,
 		last_updated_after: str | None = None,
 		last_updated_before: str | None = None,
-		order_statuses: list | None = None,
-		marketplace_ids: list | None = None,
-		fulfillment_channels: list | None = None,
-		payment_methods: list | None = None,
+		order_statuses: list | str | None = None,
+		marketplace_ids: list | str | None = None,
+		fulfillment_channels: list | str | None = None,
+		payment_methods: list | str | None = None,
 		buyer_email: str | None = None,
 		seller_order_id: str | None = None,
 		max_results: int = 100,
-		easyship_shipment_statuses: list | None = None,
+		easyship_shipment_statuses: list | str | None = None,
 		next_token: str | None = None,
-		amazon_order_ids: list | None = None,
+		amazon_order_ids: list | str | None = None,
 		actual_fulfillment_supply_source_id: str | None = None,
 		is_ispu: bool = False,
 		store_chain_store_id: str | None = None,
@@ -191,19 +246,24 @@ class Orders(SPAPI):
 			IsISPU=is_ispu,
 			StoreChainStoreId=store_chain_store_id,
 		)
-
-		self.list_to_dict("OrderStatuses", order_statuses, data)
-		self.list_to_dict("MarketplaceIds", marketplace_ids, data)
-		self.list_to_dict("FulfillmentChannels", fulfillment_channels, data)
-		self.list_to_dict("PaymentMethods", payment_methods, data)
-		self.list_to_dict("EasyShipShipmentStatuses", easyship_shipment_statuses, data)
-		self.list_to_dict("AmazonOrderIds", amazon_order_ids, data)
+		data = Util.remove_empty(data)
 
 		if not marketplace_ids:
 			marketplace_ids = [self.marketplace_id]
-			data["MarketplaceIds"] = marketplace_ids
+
+		self.list_to_comma_str("OrderStatuses", order_statuses, data)
+		self.list_to_comma_str("MarketplaceIds", marketplace_ids, data)
+		self.list_to_comma_str("FulfillmentChannels", fulfillment_channels, data)
+		self.list_to_comma_str("PaymentMethods", payment_methods, data)
+		self.list_to_comma_str("EasyShipShipmentStatuses", easyship_shipment_statuses, data)
+		self.list_to_comma_str("AmazonOrderIds", amazon_order_ids, data)
 
 		return self.make_request(params=data)
+
+	def get_order(self, order_id: str) -> dict:
+		"""Returns the order that you specify."""
+		append_to_base_uri = f"/{order_id}"
+		return self.make_request(append_to_base_uri=append_to_base_uri)
 
 	def get_order_items(self, order_id: str, next_token: str | None = None) -> dict:
 		"""Returns detailed order item information for the order indicated by the specified order ID. If NextToken is provided, it's used to retrieve the next page of order items."""
