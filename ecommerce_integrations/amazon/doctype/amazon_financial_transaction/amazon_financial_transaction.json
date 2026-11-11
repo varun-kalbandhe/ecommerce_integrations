@@ -1,0 +1,290 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:AFT-{amazon_transaction_id}",
+ "creation": "2026-10-09 14:45:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "search_fields": "amazon_order_id,amazon_transaction_id,seller_sku,marketplace",
+ "title_field": "amazon_order_id",
+ "field_order": [
+  "amazon_transaction_id",
+  "transaction_type",
+  "transaction_status",
+  "posted_date",
+  "column_break_1",
+  "total_amount",
+  "currency",
+  "sync_status",
+  "reconciliation_status",
+  "accounting_status",
+  "accounting_category",
+  "accounting_reference",
+  "debit_account",
+  "credit_account",
+  "section_break_identifiers",
+  "amazon_order_id",
+  "amazon_order_item_id",
+  "seller_sku",
+  "asin",
+  "column_break_identifiers_2",
+  "marketplace",
+  "marketplace_id",
+  "settlement_id",
+  "financial_event_group_id",
+  "section_break_links",
+  "sales_order",
+  "column_break_links_2",
+  "sales_invoice",
+  "section_break_breakdowns",
+  "breakdowns",
+  "section_break_audit",
+  "payload_hash",
+  "raw_response"
+ ],
+ "fields": [
+  {
+   "fieldname": "amazon_transaction_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Amazon Transaction ID",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "transaction_type",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Transaction Type"
+  },
+  {
+   "default": "RELEASED",
+   "fieldname": "transaction_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Transaction Status",
+   "options": "\nDEFERRED\nRELEASED\nDEFERRED_RELEASED\nOther"
+  },
+  {
+   "fieldname": "posted_date",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Posted Date"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "total_amount",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Total Amount"
+  },
+  {
+   "fieldname": "currency",
+   "fieldtype": "Data",
+   "label": "Currency"
+  },
+  {
+   "default": "Synced",
+   "fieldname": "sync_status",
+   "fieldtype": "Select",
+   "label": "Sync Status",
+   "options": "Synced\nPending\nFailed"
+  },
+  {
+   "default": "Unreconciled",
+   "fieldname": "reconciliation_status",
+   "fieldtype": "Select",
+   "label": "Reconciliation Status",
+   "options": "Unreconciled\nPartially Reconciled\nReconciled"
+  },
+  {
+   "default": "Pending",
+   "fieldname": "accounting_status",
+   "fieldtype": "Select",
+   "label": "Accounting Status",
+   "options": "Pending\nReady\nPosted\nFailed\nReconciled",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "accounting_category",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Accounting Category"
+  },
+  {
+   "fieldname": "accounting_reference",
+   "fieldtype": "Data",
+   "label": "Accounting Reference"
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Date",
+   "label": "Accounting Posting Date"
+  },
+  {
+   "fieldname": "journal_entry",
+   "fieldtype": "Link",
+   "label": "Journal Entry",
+   "options": "Journal Entry"
+  },
+  {
+   "fieldname": "payment_entry",
+   "fieldtype": "Link",
+   "label": "Payment Entry",
+   "options": "Payment Entry"
+  },
+  {
+   "fieldname": "accounting_error",
+   "fieldtype": "Small Text",
+   "label": "Accounting Error / Message"
+  },
+  {
+   "fieldname": "debit_account",
+   "fieldtype": "Link",
+   "label": "Primary Debit Account",
+   "options": "Account"
+  },
+  {
+   "fieldname": "credit_account",
+   "fieldtype": "Link",
+   "label": "Primary Credit Account",
+   "options": "Account"
+  },
+  {
+   "fieldname": "section_break_identifiers",
+   "fieldtype": "Section Break",
+   "label": "Order & Item Identifiers"
+  },
+  {
+   "fieldname": "amazon_order_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Amazon Order ID",
+   "search_index": 1
+  },
+  {
+   "fieldname": "amazon_order_item_id",
+   "fieldtype": "Data",
+   "label": "Amazon Order Item ID"
+  },
+  {
+   "fieldname": "seller_sku",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Seller SKU"
+  },
+  {
+   "fieldname": "asin",
+   "fieldtype": "Data",
+   "label": "ASIN"
+  },
+  {
+   "fieldname": "column_break_identifiers_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "marketplace",
+   "fieldtype": "Data",
+   "label": "Marketplace"
+  },
+  {
+   "fieldname": "marketplace_id",
+   "fieldtype": "Data",
+   "label": "Marketplace ID"
+  },
+  {
+   "fieldname": "settlement_id",
+   "fieldtype": "Data",
+   "label": "Settlement ID"
+  },
+  {
+   "fieldname": "financial_event_group_id",
+   "fieldtype": "Data",
+   "label": "Financial Event Group ID"
+  },
+  {
+   "fieldname": "section_break_links",
+   "fieldtype": "Section Break",
+   "label": "Frappe Links"
+  },
+  {
+   "fieldname": "sales_order",
+   "fieldtype": "Link",
+   "label": "Sales Order",
+   "options": "Sales Order"
+  },
+  {
+   "fieldname": "column_break_links_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "sales_invoice",
+   "fieldtype": "Link",
+   "label": "Sales Invoice",
+   "options": "Sales Invoice"
+  },
+  {
+   "fieldname": "section_break_breakdowns",
+   "fieldtype": "Section Break",
+   "label": "Breakdowns"
+  },
+  {
+   "fieldname": "breakdowns",
+   "fieldtype": "Table",
+   "label": "Breakdowns",
+   "options": "Amazon Financial Breakdown"
+  },
+  {
+   "fieldname": "section_break_audit",
+   "fieldtype": "Section Break",
+   "label": "Audit & Raw Data"
+  },
+  {
+   "fieldname": "payload_hash",
+   "fieldtype": "Data",
+   "label": "Payload Hash",
+   "read_only": 1
+  },
+  {
+   "fieldname": "raw_response",
+   "fieldtype": "Code",
+   "label": "Raw Response",
+   "options": "JSON",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-10-09 14:45:00.000000",
+ "modified_by": "Administrator",
+ "module": "Amazon",
+ "name": "Amazon Financial Transaction",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

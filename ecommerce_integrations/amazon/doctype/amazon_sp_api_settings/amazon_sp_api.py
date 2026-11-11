@@ -7,10 +7,12 @@ from requests import request
 __all__ = [
 	"SPAPIError",
 	"Finances",
+	"FinancesV20240619",
 	"Orders",
 	"CatalogItems",
 	"ListingsItems",
 	"ProductFees",
+	"Reports",
 ]
 
 
@@ -61,7 +63,7 @@ class SPAPIError(Exception):
 	def __init__(self, *args, **kwargs) -> None:
 		self.error = kwargs.get("error", "-")
 		self.error_description = kwargs.get("error_description", "-")
-		super().__init__(*args)
+		super().__init__(f"{self.error}: {self.error_description}")
 
 
 class SPAPI:
@@ -130,7 +132,11 @@ class SPAPI:
 			data=data,
 			headers=headers,
 		)
-		return response.json()
+		result = response.json()
+		if "errors" in result:
+			error = result["errors"][0]
+			raise SPAPIError(error=error.get("code"), error_description=error.get("message"))
+		return result
 
 	def list_to_dict(self, key: str, values: list, data: dict) -> None:
 		if values and isinstance(values, list):
@@ -169,6 +175,72 @@ class FinancesV20240619(SPAPI):
 			nextToken=next_token,
 		)
 		return self.make_request(append_to_base_uri="transactions", params=data)
+
+	def get_transactions(
+		self,
+		posted_after: str | None = None,
+		posted_before: str | None = None,
+		max_pages: int | None = None,
+		max_retries: int = 3,
+		retry_delay: float = 2.0,
+	) -> list[dict]:
+		"""
+		Fetches all transactions in date range [posted_after, posted_before] across all pages.
+		Handles nextToken pagination, rate-limit backoff (429 / QuotaExceeded), and errors defensively.
+		Returns a list of raw transaction dictionaries.
+		"""
+		import time
+
+		all_transactions = []
+		next_token = None
+		page_count = 0
+
+		while True:
+			params = {
+				"posted_after": posted_after if not next_token else None,
+				"posted_before": posted_before if not next_token else None,
+				"next_token": next_token,
+			}
+
+			# Rate limit / retry loop per page
+			resp = None
+			last_err = None
+			for attempt in range(max_retries):
+				try:
+					resp = self.list_transactions(**params)
+					break
+				except SPAPIError as e:
+					last_err = e
+					# Check for rate limit / throttle indicators
+					err_code = str(getattr(e, "error", "")).lower()
+					err_desc = str(getattr(e, "error_description", "")).lower()
+					is_rate_limit = any(term in err_code or term in err_desc for term in ["429", "throttl", "quota", "ratelimit"])
+					if is_rate_limit and attempt < max_retries - 1:
+						backoff = retry_delay * (2 ** attempt)
+						time.sleep(backoff)
+						continue
+					elif attempt < max_retries - 1:
+						time.sleep(retry_delay)
+						continue
+					else:
+						raise last_err
+
+			if not resp:
+				break
+
+			payload = resp.get("payload") or {}
+			transactions = payload.get("transactions") or []
+			all_transactions.extend(transactions)
+
+			page_count += 1
+			if max_pages and page_count >= max_pages:
+				break
+
+			next_token = payload.get("nextToken")
+			if not next_token:
+				break
+
+		return all_transactions
 
 
 class Finances(SPAPI):
@@ -361,6 +433,43 @@ class ProductFees(SPAPI):
 		return self.make_request(
 			method="POST", append_to_base_uri=append_to_base_uri, data=json.dumps(body)
 		)
+
+
+class Reports(SPAPI):
+	"""Amazon Reports API (2021-06-30)"""
+
+	BASE_URI = "/reports/2021-06-30/"
+
+	def get_reports(
+		self,
+		report_types: list | str | None = None,
+		processing_statuses: list | str | None = None,
+		marketplace_ids: list | str | None = None,
+		page_size: int = 10,
+		created_since: str | None = None,
+		created_until: str | None = None,
+		next_token: str | None = None,
+	) -> dict:
+		"""Returns reports matching criteria."""
+		data = dict(
+			pageSize=page_size,
+			createdSince=created_since,
+			createdUntil=created_until,
+			nextToken=next_token,
+		)
+		if not marketplace_ids:
+			marketplace_ids = [self.marketplace_id]
+
+		self.list_to_comma_str("reportTypes", report_types, data)
+		self.list_to_comma_str("processingStatuses", processing_statuses, data)
+		self.list_to_comma_str("marketplaceIds", marketplace_ids, data)
+
+		return self.make_request(append_to_base_uri="reports", params=data)
+
+	def get_report_document(self, report_document_id: str) -> dict:
+		"""Returns report document download URL and encryption metadata."""
+		append_to_base_uri = f"documents/{report_document_id}"
+		return self.make_request(append_to_base_uri=append_to_base_uri)
 
 
 class Util:

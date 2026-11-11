@@ -1,0 +1,115 @@
+{
+ "actions": [],
+ "creation": "2026-10-09 15:10:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "transaction_type",
+  "order_id",
+  "order_item_code",
+  "sku",
+  "column_break_1",
+  "amount_type",
+  "amount_description",
+  "amount",
+  "posted_date",
+  "section_break_reconciliation",
+  "reconciliation_status",
+  "matched_financial_transaction",
+  "column_break_2",
+  "raw_line"
+ ],
+ "fields": [
+  {
+   "fieldname": "transaction_type",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Transaction Type"
+  },
+  {
+   "fieldname": "order_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Order ID"
+  },
+  {
+   "fieldname": "order_item_code",
+   "fieldtype": "Data",
+   "label": "Order Item Code"
+  },
+  {
+   "fieldname": "sku",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "SKU"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "amount_type",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Amount Type"
+  },
+  {
+   "fieldname": "amount_description",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Amount Description"
+  },
+  {
+   "fieldname": "amount",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Amount"
+  },
+  {
+   "fieldname": "posted_date",
+   "fieldtype": "Datetime",
+   "label": "Posted Date"
+  },
+  {
+   "fieldname": "section_break_reconciliation",
+   "fieldtype": "Section Break",
+   "label": "Reconciliation"
+  },
+  {
+   "default": "Unmatched",
+   "fieldname": "reconciliation_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Reconciliation Status",
+   "options": "Unmatched\nMatched\nIgnored"
+  },
+  {
+   "fieldname": "matched_financial_transaction",
+   "fieldtype": "Link",
+   "label": "Matched Financial Transaction",
+   "options": "Amazon Financial Transaction"
+  },
+  {
+   "fieldname": "column_break_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "raw_line",
+   "fieldtype": "Small Text",
+   "label": "Raw TSV Line"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-10-09 15:10:00.000000",
+ "modified_by": "Administrator",
+ "module": "Amazon",
+ "name": "Amazon Settlement Entry",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

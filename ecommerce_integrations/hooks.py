@@ -46,7 +46,13 @@ doctype_js = {
 	"Stock Entry": "public/js/unicommerce/stock_entry.js",
 	"Pick List": "public/js/unicommerce/pick_list.js",
 }
-doctype_list_js = {"Sales Order": "public/js/amazon_sales_order_list.js"}
+doctype_list_js = {
+	"Sales Order": "public/js/amazon_sales_order_list.js",
+	"Amazon Financial Transaction": "amazon/doctype/amazon_financial_transaction/amazon_financial_transaction_list.js",
+}
+standard_queries = {
+	"Amazon Financial Transaction": "ecommerce_integrations.amazon.doctype.amazon_financial_transaction.amazon_financial_transaction.transaction_query",
+}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
 
@@ -127,7 +133,13 @@ doc_events = {
 	"Item Price": {"on_change": "ecommerce_integrations.utils.price_list.discard_item_prices"},
 	"Pick List": {"validate": "ecommerce_integrations.unicommerce.pick_list.validate"},
 	"Sales Invoice": {
-		"on_submit": "ecommerce_integrations.unicommerce.invoice.on_submit",
+		"validate": [
+			"ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sales_invoice_taxes.sync_amazon_charges_to_sales_invoice",
+		],
+		"on_submit": [
+			"ecommerce_integrations.unicommerce.invoice.on_submit",
+			"ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sales_invoice_taxes.on_sales_invoice_submit",
+		],
 		"on_cancel": "ecommerce_integrations.unicommerce.invoice.on_cancel",
 	},
 }

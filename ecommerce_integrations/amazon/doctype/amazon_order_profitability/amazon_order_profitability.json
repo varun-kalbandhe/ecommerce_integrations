@@ -1,0 +1,254 @@
+{
+ "actions": [],
+ "autoname": "format:AOP-{amazon_order_id}",
+ "creation": "2026-10-09 16:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "amazon_order_id",
+  "order_date",
+  "marketplace",
+  "currency",
+  "column_break_1",
+  "sales_order",
+  "sales_invoice",
+  "customer",
+  "company",
+  "calculation_status",
+  "section_break_financials",
+  "revenue",
+  "product_cogs",
+  "amazon_fees",
+  "shipping_expense",
+  "column_break_2",
+  "advertising_expense",
+  "other_amazon_expense",
+  "refund_amount",
+  "adjustment_amount",
+  "net_profit",
+  "profit_margin",
+  "section_break_items",
+  "items",
+  "section_break_audit",
+  "calculated_on",
+  "notes"
+ ],
+ "fields": [
+  {
+   "fieldname": "amazon_order_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Amazon Order ID",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "order_date",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Order Date"
+  },
+  {
+   "fieldname": "marketplace",
+   "fieldtype": "Data",
+   "label": "Marketplace"
+  },
+  {
+   "default": "INR",
+   "fieldname": "currency",
+   "fieldtype": "Link",
+   "label": "Currency",
+   "options": "Currency"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "sales_order",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Sales Order",
+   "options": "Sales Order"
+  },
+  {
+   "fieldname": "sales_invoice",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Sales Invoice",
+   "options": "Sales Invoice"
+  },
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "label": "Customer",
+   "options": "Customer"
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company"
+  },
+  {
+   "default": "Estimated",
+   "fieldname": "calculation_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Calculation Status",
+   "options": "Estimated\nFinal\nRecalculated\nEstimated / COGS Missing"
+  },
+  {
+   "fieldname": "section_break_financials",
+   "fieldtype": "Section Break",
+   "label": "Profitability Summary"
+  },
+  {
+   "default": "0.0",
+   "fieldname": "revenue",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Net Revenue",
+   "read_only": 1
+  },
+  {
+   "default": "0.0",
+   "fieldname": "product_cogs",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Product COGS",
+   "read_only": 1
+  },
+  {
+   "default": "0.0",
+   "fieldname": "amazon_fees",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Amazon Fees",
+   "read_only": 1
+  },
+  {
+   "default": "0.0",
+   "fieldname": "shipping_expense",
+   "fieldtype": "Currency",
+   "label": "Shipping Expense (Easy Ship)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0.0",
+   "fieldname": "advertising_expense",
+   "fieldtype": "Currency",
+   "label": "Advertising Expense",
+   "read_only": 1
+  },
+  {
+   "default": "0.0",
+   "fieldname": "other_amazon_expense",
+   "fieldtype": "Currency",
+   "label": "Other Amazon Expense",
+   "read_only": 1
+  },
+  {
+   "default": "0.0",
+   "fieldname": "refund_amount",
+   "fieldtype": "Currency",
+   "label": "Refund Amount",
+   "read_only": 1
+  },
+  {
+   "default": "0.0",
+   "fieldname": "adjustment_amount",
+   "fieldtype": "Currency",
+   "label": "Reimbursements / Adjustments",
+   "read_only": 1
+  },
+  {
+   "default": "0.0",
+   "fieldname": "net_profit",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Net Profit",
+   "read_only": 1
+  },
+  {
+   "default": "0.0",
+   "fieldname": "profit_margin",
+   "fieldtype": "Percent",
+   "in_list_view": 1,
+   "label": "Profit Margin %",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_items",
+   "fieldtype": "Section Break",
+   "label": "Order Items Profitability"
+  },
+  {
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Items",
+   "options": "Amazon Order Profitability Item"
+  },
+  {
+   "fieldname": "section_break_audit",
+   "fieldtype": "Section Break",
+   "label": "Audit & Timestamp"
+  },
+  {
+   "fieldname": "calculated_on",
+   "fieldtype": "Datetime",
+   "label": "Calculated On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Calculation Notes"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-10-09 16:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Amazon",
+ "name": "Amazon Order Profitability",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Accounts Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

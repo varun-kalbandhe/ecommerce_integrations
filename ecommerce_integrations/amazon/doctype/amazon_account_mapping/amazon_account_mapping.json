@@ -1,0 +1,142 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:AMZ-ACC-{company}",
+ "creation": "2026-10-09 15:05:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "company",
+  "clearing_account",
+  "column_break_1",
+  "bank_account",
+  "receivable_account",
+  "default_customer",
+  "section_break_tax",
+  "input_cgst_account",
+  "input_sgst_account",
+  "input_igst_account",
+  "column_break_tax",
+  "tcs_receivable_account",
+  "tds_receivable_account",
+  "section_break_rules",
+  "rules"
+ ],
+ "fields": [
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "clearing_account",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Amazon Clearing Account",
+   "options": "Account",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "bank_account",
+   "fieldtype": "Link",
+   "label": "Default Settlement Bank Account",
+   "options": "Account"
+  },
+  {
+   "fieldname": "receivable_account",
+   "fieldtype": "Link",
+   "label": "Customer Receivable Account",
+   "options": "Account"
+  },
+  {
+   "fieldname": "default_customer",
+   "fieldtype": "Link",
+   "label": "Default Marketplace Customer (for Party)",
+   "options": "Customer"
+  },
+  {
+   "fieldname": "section_break_tax",
+   "fieldtype": "Section Break",
+   "label": "Tax & Withholding Accounts"
+  },
+  {
+   "fieldname": "input_cgst_account",
+   "fieldtype": "Link",
+   "label": "Input CGST Account (Fee GST)",
+   "options": "Account"
+  },
+  {
+   "fieldname": "input_sgst_account",
+   "fieldtype": "Link",
+   "label": "Input SGST Account (Fee GST)",
+   "options": "Account"
+  },
+  {
+   "fieldname": "input_igst_account",
+   "fieldtype": "Link",
+   "label": "Input IGST Account (Fee GST)",
+   "options": "Account"
+  },
+  {
+   "fieldname": "column_break_tax",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "tcs_receivable_account",
+   "fieldtype": "Link",
+   "label": "TCS Receivable Account",
+   "options": "Account"
+  },
+  {
+   "fieldname": "tds_receivable_account",
+   "fieldtype": "Link",
+   "label": "TDS Receivable Account (Sec 194-O)",
+   "options": "Account"
+  },
+  {
+   "fieldname": "section_break_rules",
+   "fieldtype": "Section Break",
+   "label": "Category & Fee Mapping Rules"
+  },
+  {
+   "fieldname": "rules",
+   "fieldtype": "Table",
+   "label": "Mapping Rules",
+   "options": "Amazon Account Map Rule"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-10-09 15:05:00.000000",
+ "modified_by": "Administrator",
+ "module": "Amazon",
+ "name": "Amazon Account Mapping",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

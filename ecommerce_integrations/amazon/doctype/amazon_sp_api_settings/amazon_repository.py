@@ -18,11 +18,66 @@ from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api 
 	ListingsItems,
 	Orders,
 	ProductFees,
+	Reports,
 	SPAPIError,
 )
 from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api_settings import (
 	AmazonSPAPISettings,
 )
+from ecommerce_integrations.amazon.doctype.amazon_account_mapping.amazon_account_mapping import (
+	get_account_mapping,
+)
+
+
+
+def extract_amazon_order_id(tx: dict) -> str | None:
+	"""
+	Extracts and normalizes the Amazon Order ID from an SP-API transaction payload.
+	Inspects:
+	1. tx.relatedIdentifiers (case-insensitive for ORDER_ID / AMAZON_ORDER_ID)
+	2. items[].relatedIdentifiers (nested item identifiers)
+	3. top-level keys (orderId, amazonOrderId, etc.)
+	4. contexts (orderId, amazonOrderId)
+	Ensures it does NOT confuse item codes, SKU, ASIN, Sales Order, or Sales Invoice.
+	"""
+	if not isinstance(tx, dict):
+		return None
+
+	target_keys = {"ORDER_ID", "ORDERID", "AMAZON_ORDER_ID", "AMAZONORDERID"}
+
+	# 1. Transaction-level relatedIdentifiers
+	for r in (tx.get("relatedIdentifiers") or []):
+		if isinstance(r, dict):
+			name = (r.get("relatedIdentifierName") or "").strip().upper().replace("-", "_")
+			val = str(r.get("relatedIdentifierValue") or "").strip()
+			if name in target_keys and val:
+				return val
+
+	# 2. Nested item-level relatedIdentifiers
+	for itm in (tx.get("items") or []):
+		if isinstance(itm, dict):
+			for r in (itm.get("relatedIdentifiers") or []):
+				if isinstance(r, dict):
+					name = (r.get("itemRelatedIdentifierName") or r.get("relatedIdentifierName") or "").strip().upper().replace("-", "_")
+					val = str(r.get("itemRelatedIdentifierValue") or r.get("relatedIdentifierValue") or "").strip()
+					if name in target_keys and val:
+						return val
+
+	# 3. Top-level keys
+	for k in ("orderId", "amazonOrderId", "amazon_order_id", "OrderId", "AmazonOrderId"):
+		val = str(tx.get(k) or "").strip()
+		if val:
+			return val
+
+	# 4. Contexts
+	for ctx in (tx.get("contexts") or []):
+		if isinstance(ctx, dict):
+			for k in ("orderId", "amazonOrderId", "amazon_order_id", "order_id"):
+				val = str(ctx.get(k) or "").strip()
+				if val:
+					return val
+
+	return None
 
 
 class AmazonRepository:
@@ -67,12 +122,7 @@ class AmazonRepository:
 				title=f'Method "{sp_api_method.__name__}" failed',
 			)
 
-		self.amz_setting.enable_sync = 0
-		self.amz_setting.save()
-
-		frappe.throw(
-			_("Scheduled sync has been temporarily disabled because maximum retries have been exceeded!")
-		)
+		return {}
 
 	def get_finances_instance(self) -> Finances:
 		return Finances(**self.instance_params)
@@ -387,14 +437,18 @@ class AmazonRepository:
 
 		catalog_items = self.get_catalog_items_instance()
 		asin = order_item.get("ASIN") or order_item.get("asin")
-		amazon_item = catalog_items.get_catalog_item(asin)
+		
+		try:
+			amazon_item = catalog_items.get_catalog_item(asin)
+		except Exception as e:
+			frappe.log_error(
+				message=frappe.get_traceback(),
+				title=f'Catalog Items API failed for ASIN "{asin}"',
+			)
+			amazon_item = {}
 
 		if not isinstance(amazon_item, dict):
-			frappe.throw(
-				_("Invalid response received from Amazon Catalog Items API for ASIN {0}.").format(
-					asin
-				)
-			)
+			amazon_item = {}
 
 		if "errors" in amazon_item:
 			errors = amazon_item.get("errors") or []
@@ -405,7 +459,7 @@ class AmazonRepository:
 				message=f"{error_code}: {error_msg}",
 				title=f'Catalog Items API failed for ASIN "{asin}"',
 			)
-			raise SPAPIError(error=error_code, error_description=error_msg)
+			amazon_item = {}
 
 		item = frappe.new_doc("Item")
 
@@ -539,6 +593,7 @@ class AmazonRepository:
 						{
 							"item_code": self.get_item_code(order_item),
 							"item_name": order_item.get("SellerSKU"),
+							"amazon_item_code": order_item.get("SellerSKU"),
 							"description": order_item.get("Title"),
 							"rate": order_item.get("ItemPrice", {}).get("Amount", 0),
 							"qty": order_item.get("QuantityOrdered"),
@@ -546,6 +601,7 @@ class AmazonRepository:
 							"stock_uom": "Nos",
 							"warehouse": warehouse,
 							"conversion_factor": 1,
+							"_raw_order_item": order_item,
 						}
 					)
 
@@ -804,6 +860,7 @@ class AmazonRepository:
 				make_address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
 				make_address.address_type = "Shipping"
 				make_address.insert()
+				return make_address.name
 
 		order_id = order.get("AmazonOrderId")
 		so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
@@ -825,7 +882,7 @@ class AmazonRepository:
 				return
 
 			customer_name = create_customer(order)
-			create_address(order, customer_name)
+			address_name = create_address(order, customer_name)
 
 			delivery_date = dateutil.parser.parse(order.get("LatestShipDate")).strftime("%Y-%m-%d")
 			transaction_date = dateutil.parser.parse(order.get("PurchaseDate")).strftime("%Y-%m-%d")
@@ -859,8 +916,31 @@ class AmazonRepository:
 			so.transaction_date = transaction_date
 			so.company = self.amz_setting.company
 
+			if address_name:
+				so.customer_address = address_name
+				so.shipping_address_name = address_name
+
+			# Evaluate GST inter-state correctly so Sales Order gets the right tax template
+			company_state_code = self.get_company_state_code(so.company)
+			pos_code = ""
+			if address_name:
+				address_doc = frappe.get_cached_doc("Address", address_name)
+				pos_code = address_doc.gst_state_number or ""
+			is_inter_state = bool(pos_code and company_state_code and pos_code != company_state_code)
+
+			so.taxes_and_charges = self.get_sales_taxes_and_charges_template(so.company, is_inter_state)
+
 			missing_hsn_found = False
+			order_items_raw = order.get("OrderItems", [])
 			for item in items:
+				matched_amz_item = item.pop("_raw_order_item", None)
+				if not matched_amz_item:
+					matched_amz_item = next(
+						(i for i in order_items_raw if i.get("SellerSKU") == item.get("amazon_item_code")), None
+					)
+				item["item_tax_template"] = self.get_product_gst_template(
+					item["item_code"], so.company, is_inter_state, order_item=matched_amz_item
+				)
 				so.append("items", item)
 				
 				item_name = frappe.db.get_value("Item", item["item_code"], "item_name", cache=True)
@@ -1205,7 +1285,13 @@ class AmazonRepository:
 
 		return si.name
 
-	def get_orders(self, created_after: str | None = None, created_before: str | None = None, last_updated_after: str | None = None) -> list:
+	def get_orders(
+		self,
+		created_after: str | None = None,
+		created_before: str | None = None,
+		last_updated_after: str | None = None,
+		return_summary: bool = False,
+	) -> list | dict:
 		orders = self.get_orders_instance()
 		order_statuses = [
 			"PendingAvailability",
@@ -1236,7 +1322,16 @@ class AmazonRepository:
 			**kwargs,
 		)
 
-		sales_orders = []
+		summary = {
+			"total_orders": 0,
+			"successful_orders": [],
+			"failed_orders": [],
+			"skipped_orders": [],
+			"sales_orders": [],
+			"sales_invoices": [],
+			"payment_entries": [],
+			"delivery_notes": [],
+		}
 
 		while True:
 			orders_list = (orders_payload or {}).get("Orders")
@@ -1246,9 +1341,36 @@ class AmazonRepository:
 				break
 
 			for order in orders_list:
-				sales_order, *_ = self.sync_order(order)
-				if sales_order:
-					sales_orders.append(sales_order)
+				order_id = order.get("AmazonOrderId") or "Unknown"
+				summary["total_orders"] += 1
+				try:
+					sales_order, si_name, pe_name, dn_name = self.sync_order(order)
+					if sales_order:
+						summary["successful_orders"].append(order_id)
+						summary["sales_orders"].append(sales_order)
+						if si_name:
+							summary["sales_invoices"].append(si_name)
+						if pe_name:
+							summary["payment_entries"].append(pe_name)
+						if dn_name:
+							summary["delivery_notes"].append(dn_name)
+					else:
+						err = getattr(self, "_last_order_error", {}).get(order_id)
+						if err:
+							summary["failed_orders"].append({
+								"order_id": order_id,
+								"reason": err,
+							})
+						else:
+							summary["skipped_orders"].append(order_id)
+				except Exception as e:
+					frappe.db.rollback()
+					err_msg = str(e).strip() or type(e).__name__
+					summary["failed_orders"].append({
+						"order_id": order_id,
+						"reason": err_msg,
+					})
+					frappe.log_error(f"Amazon Order {order_id} failed: {err_msg}", "Amazon Order Sync")
 
 			if not next_token:
 				break
@@ -1260,7 +1382,10 @@ class AmazonRepository:
 				next_token=next_token,
 			)
 
-		return sales_orders
+		if return_summary:
+			return summary
+
+		return summary["sales_orders"]
 
 	def get_catalog_items_instance(self) -> CatalogItems:
 		return CatalogItems(**self.instance_params)
@@ -1829,12 +1954,27 @@ class AmazonRepository:
 		Payment Entry requires confirmed financial settlement (otherwise SI remains Outstanding).
 		Returns (sales_order_name, sales_invoice_name, payment_entry_name, delivery_note_name).
 		"""
+		amazon_order_id = order.get("AmazonOrderId") or "Unknown"
+		if not hasattr(self, "_last_order_error"):
+			self._last_order_error = {}
+		self._last_order_error.pop(amazon_order_id, None)
+
 		try:
 			sales_order = self.create_sales_order(order)
 			if not sales_order:
 				return None, None, None, None
 
-			si_name, pe_name = self.sync_sales_order_invoice_and_payment(sales_order, order=order)
+			si_name, pe_name = None, None
+			try:
+				si_name, pe_name = self.sync_sales_order_invoice_and_payment(sales_order, order=order)
+			except Exception as e:
+				frappe.db.rollback()
+				frappe.log_error(
+					title=f"Failed to create Sales Invoice for {sales_order} (Amazon {amazon_order_id})",
+					message=frappe.get_traceback(),
+					reference_doctype="Sales Order",
+					reference_name=sales_order,
+				)
 
 			dn_name = None
 			so_docstatus = frappe.db.get_value("Sales Order", sales_order, "docstatus")
@@ -1862,9 +2002,26 @@ class AmazonRepository:
 
 			return sales_order, si_name, pe_name, dn_name
 		except Exception as e:
-			amazon_order_id = order.get("AmazonOrderId")
+			frappe.db.rollback()
+			err_str = str(e).strip() or type(e).__name__
+			self._last_order_error[amazon_order_id] = err_str
+
+			try:
+				import json
+				ir = frappe.new_doc("Integration Request")
+				ir.integration_request_service = "Amazon SP-API"
+				ir.is_remote_request = 0
+				ir.request_description = f"Amazon Order Sync Failed: {amazon_order_id}"
+				ir.data = json.dumps(order, indent=4, default=str)
+				ir.error = frappe.get_traceback()
+				ir.status = "Failed"
+				ir.insert(ignore_permissions=True)
+				frappe.db.commit()
+			except Exception:
+				pass
+			
 			frappe.log_error(
-				title=f"Amazon Sync Failed for Order {amazon_order_id}",
+				title=f"Amazon Sync Failed for Order {amazon_order_id}: {err_str}",
 				message=frappe.get_traceback()
 			)
 			return None, None, None, None
@@ -2059,6 +2216,937 @@ class AmazonRepository:
 						traceback.print_exc()
 						frappe.log_error(title="SI Return Failed", message=frappe.get_traceback())
 
+	def sync_financial_transactions(
+		self,
+		posted_after: str | None = None,
+		posted_before: str | None = None,
+		max_pages: int | None = None,
+		transactions_list: list | None = None,
+	) -> list[str]:
+		"""
+		Phase 1 Ingestion:
+		Pulls all financial transactions in [posted_after, posted_before] from Finances API v2024-06-19.
+		Idempotently creates or updates Amazon Financial Transaction and child Amazon Financial Breakdown records.
+		Links Sales Order / Sales Invoice if the related Amazon Order ID exists in ERPNext.
+		Preserves the raw JSON response and computes a payload hash.
+		Catches and logs individual transaction ingestion errors via Integration Request and error log, continuing batch.
+		Returns list of processed Amazon Financial Transaction names.
+		"""
+		import hashlib
+		import json
+		from dateutil import parser as dt_parser
+
+		if transactions_list is not None:
+			transactions = transactions_list
+		else:
+			finances_client = self.get_finances_v20240619_instance()
+			transactions = finances_client.get_transactions(
+				posted_after=posted_after,
+				posted_before=posted_before,
+				max_pages=max_pages,
+				max_retries=self.amz_setting.max_retry_limit or 3,
+			)
+
+		processed_docs = []
+
+		for tx in transactions:
+			amazon_order_id = extract_amazon_order_id(tx)
+			tx_id = tx.get("transactionId")
+			if not tx_id:
+				# Generate deterministic transaction ID if missing from order/event identifiers
+				rel_ids = {
+					(r.get("relatedIdentifierName") or "").strip().upper().replace("-", "_"): r.get("relatedIdentifierValue")
+					for r in (tx.get("relatedIdentifiers") or [])
+					if isinstance(r, dict) and r.get("relatedIdentifierName")
+				}
+				ord_id = amazon_order_id or rel_ids.get("FINANCIAL_EVENT_GROUP_ID") or "NO_ID"
+				tx_type = tx.get("transactionType") or "TX"
+				tx_date = tx.get("postedDate") or "NODATE"
+				tx_id = f"{tx_type}-{ord_id}-{tx_date}"
+
+			try:
+				# 1. Normalize Header Identifiers
+				rel_ids = {}
+				for r in (tx.get("relatedIdentifiers") or []):
+					if isinstance(r, dict) and r.get("relatedIdentifierName"):
+						k = (r.get("relatedIdentifierName") or "").strip().upper().replace("-", "_")
+						rel_ids[k] = r.get("relatedIdentifierValue")
+
+				settlement_id = rel_ids.get("SETTLEMENT_ID")
+				event_group_id = rel_ids.get("FINANCIAL_EVENT_GROUP_ID")
+
+				# Marketplace and Selling Partner metadata
+				sp_meta = tx.get("sellingPartnerMetadata") or {}
+				marketplace_id = sp_meta.get("marketplaceId") or (tx.get("marketplaceDetails") or {}).get("marketplaceId")
+				marketplace_name = (tx.get("marketplaceDetails") or {}).get("marketplaceName")
+
+				# Totals
+				total_amt_dict = tx.get("totalAmount") or {}
+				total_amount = float(total_amt_dict.get("currencyAmount") or 0.0)
+				currency = total_amt_dict.get("currencyCode")
+
+				# Posted date
+				posted_date = None
+				if tx.get("postedDate"):
+					try:
+						posted_date = dt_parser.parse(tx.get("postedDate")).strftime("%Y-%m-%d %H:%M:%S")
+					except Exception:
+						posted_date = None
+
+				# Product context info from items
+				seller_sku = None
+				asin = None
+				order_item_id = None
+				items_list = tx.get("items") or []
+				for itm in items_list:
+					if not isinstance(itm, dict):
+						continue
+					for ctx in (itm.get("contexts") or []):
+						if isinstance(ctx, dict):
+							if ctx.get("sku") and not seller_sku:
+								seller_sku = ctx.get("sku")
+							if ctx.get("asin") and not asin:
+								asin = ctx.get("asin")
+					for item_rel in (itm.get("relatedIdentifiers") or []):
+						if isinstance(item_rel, dict) and not order_item_id:
+							order_item_id = item_rel.get("itemRelatedIdentifierValue")
+
+				# Link existing ERPNext Sales Order and Sales Invoice
+				sales_order = None
+				sales_invoice = None
+				if amazon_order_id:
+					sales_order = frappe.db.get_value("Sales Order", {"amazon_order_id": amazon_order_id}, "name")
+					sales_invoice = (
+						frappe.db.get_value("Sales Invoice", {"custom_marketplace_order": amazon_order_id, "docstatus": ["<", 2]}, "name")
+						or frappe.db.get_value("Sales Invoice", {"po_no": amazon_order_id, "docstatus": ["<", 2]}, "name")
+					)
+
+				# Raw response and hash
+				raw_str = json.dumps(tx, sort_keys=True, indent=2)
+				payload_hash = hashlib.sha256(raw_str.encode("utf-8")).hexdigest()
+
+				# 2. Extract Breakdowns Flattened List
+				extracted_breakdowns = []
+				from ecommerce_integrations.amazon.doctype.amazon_account_mapping.amazon_account_mapping import get_account_mapping
+				acc_mapping = get_account_mapping(self.amz_setting.company)
+
+				def parse_breakdown_tree(bd, category=None, fee_name=None, scope="Order", sku=None, itm_id=None):
+					if not isinstance(bd, dict):
+						return
+					b_type = bd.get("breakdownType") or "Other"
+					b_amt_dict = bd.get("breakdownAmount") or {}
+					b_amt = float(b_amt_dict.get("currencyAmount") or 0.0)
+					b_curr = b_amt_dict.get("currencyCode") or currency
+
+					# If b_type is a specific fee type (e.g. FixedClosingFee, MFNPostageFee, Commission, etc.)
+					current_fee = fee_name
+					if b_type not in ("AmazonFees", "Expenses", "Sales", "Base", "Tax", "ProductCharges", "TaxCollectedAtSource", "TaxWithholding"):
+						current_fee = b_type
+
+					sub_bds = bd.get("breakdowns") or []
+					if not sub_bds:
+						# Leaf breakdown: resolve accounting heads
+						resolved_acc = None
+						role = "Debit"
+						resolved_fee = current_fee or (b_type if category and category != b_type else None)
+						if acc_mapping:
+							resolved_acc, role = acc_mapping.get_account_for_breakdown(
+								category=category or b_type,
+								fee_type=resolved_fee,
+								breakdown_type=b_type,
+							)
+
+						dr_acc = resolved_acc if role == "Debit" else (acc_mapping.clearing_account if acc_mapping else None)
+						cr_acc = resolved_acc if role == "Credit" else (acc_mapping.clearing_account if acc_mapping else None)
+
+						extracted_breakdowns.append({
+							"breakdown_type": b_type,
+							"category": category or b_type,
+							"fee_type": resolved_fee,
+							"amount": b_amt,
+							"currency": b_curr,
+							"allocation_scope": scope,
+							"seller_sku": sku,
+							"amazon_order_item_id": itm_id,
+							"accounting_category": category or b_type,
+							"debit_account": dr_acc,
+							"credit_account": cr_acc,
+							"raw_source": json.dumps(bd),
+						})
+					else:
+						# Recurse down tree
+						for sub in sub_bds:
+							parse_breakdown_tree(
+								sub,
+								category=category or b_type,
+								fee_name=current_fee,
+								scope=scope,
+								sku=sku,
+								itm_id=itm_id,
+							)
+
+				# Top-level transaction breakdowns (Order / Account scope)
+				for top_bd in (tx.get("breakdowns") or []):
+					scope = "Order" if amazon_order_id else "Account"
+					parse_breakdown_tree(top_bd, category=top_bd.get("breakdownType"), scope=scope)
+
+				# Item-level breakdowns (Item scope)
+				for itm in items_list:
+					if not isinstance(itm, dict):
+						continue
+					itm_sku = None
+					itm_asin = None
+					for ctx in (itm.get("contexts") or []):
+						if isinstance(ctx, dict):
+							itm_sku = ctx.get("sku") or itm_sku
+							itm_asin = ctx.get("asin") or itm_asin
+
+					itm_rel_id = None
+					for item_rel in (itm.get("relatedIdentifiers") or []):
+						if isinstance(item_rel, dict) and not itm_rel_id:
+							itm_rel_id = item_rel.get("itemRelatedIdentifierValue")
+
+					for itm_bd in (itm.get("breakdowns") or []):
+						parse_breakdown_tree(
+							itm_bd,
+							category=itm_bd.get("breakdownType"),
+							scope="Item",
+							sku=itm_sku or seller_sku,
+							itm_id=itm_rel_id or order_item_id,
+						)
+
+				# Overall transaction accounting category
+				tx_cat = tx.get("transactionType") or "Transaction"
+				tx_dr = None
+				tx_cr = None
+				if acc_mapping:
+					if tx_cat == "Shipment":
+						tx_dr = acc_mapping.clearing_account
+						tx_cr = acc_mapping.receivable_account
+					elif tx_cat in ["Transfer", "FundTransfer"]:
+						tx_dr = acc_mapping.bank_account
+						tx_cr = acc_mapping.clearing_account
+					elif tx_cat in ["ServiceFee", "Expenses"]:
+						tx_dr = frappe.db.get_value("Account", {"account_name": ["like", "%Amazon Fee%"], "company": self.amz_setting.company}, "name")
+						tx_cr = acc_mapping.clearing_account
+
+				# 3. Idempotent Upsert into Amazon Financial Transaction
+				existing_name = frappe.db.get_value(
+					"Amazon Financial Transaction",
+					{"amazon_transaction_id": tx_id},
+					"name",
+				)
+
+				# Determine accounting status (Ready vs Pending)
+				act_status = "Pending"
+				if total_amount != 0.0 and acc_mapping:
+					leaf_bds = [b for b in extracted_breakdowns if b.get("allocation_scope") == "Item"] or [b for b in extracted_breakdowns if b.get("amount") != 0]
+					if leaf_bds:
+						all_mapped = True
+						for b in leaf_bds:
+							acc, _ = acc_mapping.get_account_for_breakdown(b.get("category"), b.get("fee_type"), b.get("breakdown_type"))
+							if not acc:
+								all_mapped = False
+								break
+						if all_mapped:
+							act_status = "Ready"
+
+				if existing_name:
+					doc = frappe.get_doc("Amazon Financial Transaction", existing_name)
+					doc.transaction_type = tx.get("transactionType")
+					doc.transaction_status = tx.get("transactionStatus") or "RELEASED"
+					doc.posted_date = posted_date
+					doc.total_amount = total_amount
+					doc.currency = currency
+					doc.amazon_order_id = amazon_order_id
+					doc.amazon_order_item_id = order_item_id
+					doc.seller_sku = seller_sku
+					doc.asin = asin
+					doc.marketplace = marketplace_name
+					doc.marketplace_id = marketplace_id
+					doc.settlement_id = settlement_id
+					doc.financial_event_group_id = event_group_id
+					doc.sales_order = sales_order
+					doc.sales_invoice = sales_invoice
+					doc.payload_hash = payload_hash
+					doc.raw_response = raw_str
+					doc.accounting_category = tx_cat
+					doc.debit_account = tx_dr or doc.debit_account
+					doc.credit_account = tx_cr or doc.credit_account
+					doc.accounting_reference = amazon_order_id or event_group_id
+					if doc.accounting_status not in ["Posted", "Reconciled"]:
+						doc.accounting_status = act_status
+
+					# Clear and rebuild child table to prevent duplication
+					doc.set("breakdowns", [])
+					for bd_row in extracted_breakdowns:
+						doc.append("breakdowns", bd_row)
+
+					doc.save(ignore_permissions=True)
+					processed_docs.append(doc.name)
+				else:
+					doc = frappe.new_doc("Amazon Financial Transaction")
+					doc.amazon_transaction_id = tx_id
+					doc.transaction_type = tx.get("transactionType")
+					doc.transaction_status = tx.get("transactionStatus") or "RELEASED"
+					doc.posted_date = posted_date
+					doc.total_amount = total_amount
+					doc.currency = currency
+					doc.amazon_order_id = amazon_order_id
+					doc.amazon_order_item_id = order_item_id
+					doc.seller_sku = seller_sku
+					doc.asin = asin
+					doc.marketplace = marketplace_name
+					doc.marketplace_id = marketplace_id
+					doc.settlement_id = settlement_id
+					doc.financial_event_group_id = event_group_id
+					doc.sales_order = sales_order
+					doc.sales_invoice = sales_invoice
+					doc.sync_status = "Synced"
+					doc.reconciliation_status = "Unreconciled"
+					doc.accounting_status = act_status
+					doc.accounting_category = tx_cat
+					doc.debit_account = tx_dr
+					doc.credit_account = tx_cr
+					doc.accounting_reference = amazon_order_id or event_group_id
+					doc.payload_hash = payload_hash
+					doc.raw_response = raw_str
+
+					for bd_row in extracted_breakdowns:
+						doc.append("breakdowns", bd_row)
+
+					doc.insert(ignore_permissions=True)
+					processed_docs.append(doc.name)
+
+			except Exception as e:
+				# Defensive handling: log failure via Integration Request and error log, continue next
+				import traceback
+				frappe.log_error(
+					title=f"Amazon Financial Transaction Ingestion Failed: {tx_id}",
+					message=frappe.get_traceback(),
+				)
+				ir = frappe.new_doc("Integration Request")
+				ir.integration_request_service = "Amazon SP-API Finances"
+				ir.is_remote_request = 0
+				ir.request_description = f"Financial Transaction Failed: {tx_id}"
+				ir.data = json.dumps(tx, indent=2)
+				ir.error = frappe.get_traceback()
+				ir.status = "Failed"
+				ir.insert(ignore_permissions=True)
+
+		# Auto-trigger / recalculate profitability and update Sales Invoices for synced orders
+		try:
+			from ecommerce_integrations.amazon.doctype.amazon_order_profitability.amazon_profitability_engine import AmazonProfitabilityEngine
+			from ecommerce_integrations.amazon.doctype.amazon_order_profitability.sales_invoice_amazon_profitability import (
+				update_sales_invoice_amazon_charges,
+			)
+			engine = AmazonProfitabilityEngine()
+			synced_orders = set()
+			for doc_name in processed_docs:
+				oid = frappe.db.get_value("Amazon Financial Transaction", doc_name, "amazon_order_id")
+				if oid:
+					synced_orders.add(oid)
+			for oid in synced_orders:
+				try:
+					engine.calculate_order_profitability(oid)
+				except Exception:
+					pass
+				try:
+					invoices = frappe.get_all(
+						"Sales Invoice",
+						filters={"custom_marketplace_order": oid, "docstatus": 0},
+						pluck="name",
+					)
+					for inv_name in invoices:
+						try:
+							inv_doc = frappe.get_doc("Sales Invoice", inv_name)
+							from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sales_invoice_taxes import (
+								sync_amazon_charges_to_sales_invoice,
+							)
+							sync_amazon_charges_to_sales_invoice(inv_doc)
+							inv_doc.save(ignore_permissions=True)
+						except Exception:
+							pass
+				except Exception:
+					pass
+		except Exception:
+			pass
+
+		return processed_docs
+
+	def get_reports_instance(self) -> Reports:
+		return Reports(**self.instance_params)
+
+	def sync_settlement_reports(self, page_size: int = 5, created_since: str | None = None) -> list[str]:
+		"""
+		Phase 2 Settlement Staging:
+		Searches for DONE GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2 reports via Reports API.
+		Downloads and parses Flat File V2 TSV report document.
+		Idempotently upserts Amazon Settlement master and Amazon Settlement Entry line items.
+		Matches line items against Amazon Financial Transactions where available.
+		Does NOT post final Journal Entries.
+		"""
+		import gzip
+		import json
+		import requests
+		from dateutil import parser as dt_parser
+
+		reports_client = self.get_reports_instance()
+		resp = reports_client.get_reports(
+			report_types="GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2",
+			processing_statuses="DONE",
+			page_size=page_size,
+			created_since=created_since,
+		)
+
+		reports_list = (resp.get("reports") or [])
+		processed_settlements = []
+
+		for r in reports_list:
+			rep_doc_id = r.get("reportDocumentId")
+			rep_id = r.get("reportId")
+			if not rep_doc_id:
+				continue
+
+			try:
+				doc_resp = reports_client.get_report_document(rep_doc_id)
+				dl_url = doc_resp.get("url")
+				compression = doc_resp.get("compressionAlgorithm")
+
+				if not dl_url:
+					continue
+
+				content_resp = requests.get(dl_url, timeout=60)
+				raw_bytes = content_resp.content
+				if compression == "GZIP":
+					raw_bytes = gzip.decompress(raw_bytes)
+
+				tsv_content = raw_bytes.decode("utf-8", errors="replace")
+				lines = tsv_content.splitlines()
+				if len(lines) < 2:
+					continue
+
+				# Header row
+				headers = [h.strip().lower() for h in lines[0].split("\t")]
+				# Row 1 has settlement metadata
+				first_data = [d.strip() for d in lines[1].split("\t")]
+				row_map = dict(zip(headers, first_data))
+
+				settlement_id = row_map.get("settlement-id")
+				if not settlement_id:
+					continue
+
+				def parse_dt(dt_str):
+					if not dt_str: return None
+					try:
+						# E.g. "28.09.2026 10:44:19 UTC" or ISO
+						cleaned = dt_str.replace(" UTC", "")
+						return dt_parser.parse(cleaned, dayfirst=True).strftime("%Y-%m-%d %H:%M:%S")
+					except Exception:
+						return None
+
+				start_date = parse_dt(row_map.get("settlement-start-date"))
+				end_date = parse_dt(row_map.get("settlement-end-date"))
+				deposit_date = parse_dt(row_map.get("deposit-date"))
+				total_amount = float(row_map.get("total-amount") or 0.0)
+				currency = row_map.get("currency")
+
+				entries = []
+				for line_str in lines[2:]:
+					if not line_str.strip():
+						continue
+					cols = [c.strip() for c in line_str.split("\t")]
+					c_map = dict(zip(headers, cols))
+
+					t_type = c_map.get("transaction-type")
+					ord_id = c_map.get("order-id")
+					a_type = c_map.get("amount-type")
+					a_desc = c_map.get("amount-description")
+					amt = float(c_map.get("amount") or 0.0)
+					sku = c_map.get("sku")
+					ord_item = c_map.get("order-item-code")
+					p_date = parse_dt(c_map.get("posted-date-time") or c_map.get("posted-date"))
+
+					# Match against existing Amazon Financial Transaction
+					matched_tx = None
+					if ord_id:
+						matched_tx = frappe.db.get_value("Amazon Financial Transaction", {"amazon_order_id": ord_id}, "name")
+
+					entries.append({
+						"transaction_type": t_type,
+						"order_id": ord_id,
+						"order_item_code": ord_item,
+						"sku": sku,
+						"amount_type": a_type,
+						"amount_description": a_desc,
+						"amount": amt,
+						"posted_date": p_date,
+						"reconciliation_status": "Matched" if matched_tx else "Unmatched",
+						"matched_financial_transaction": matched_tx,
+						"raw_line": line_str[:1000],
+					})
+
+				# Idempotent upsert Amazon Settlement
+				existing_settle = frappe.db.get_value("Amazon Settlement", {"settlement_id": settlement_id}, "name")
+				if existing_settle:
+					s_doc = frappe.get_doc("Amazon Settlement", existing_settle)
+					s_doc.total_amount = total_amount
+					s_doc.currency = currency
+					s_doc.start_date = start_date
+					s_doc.end_date = end_date
+					s_doc.deposit_date = deposit_date
+					s_doc.report_id = str(rep_id)
+					s_doc.report_document_id = str(rep_doc_id)
+					s_doc.set("entries", [])
+					for ent in entries:
+						s_doc.append("entries", ent)
+					s_doc.save(ignore_permissions=True)
+					processed_settlements.append(s_doc.name)
+				else:
+					s_doc = frappe.new_doc("Amazon Settlement")
+					s_doc.settlement_id = settlement_id
+					s_doc.settlement_status = "Settled"
+					s_doc.reconciliation_status = "Unreconciled"
+					s_doc.total_amount = total_amount
+					s_doc.currency = currency
+					s_doc.start_date = start_date
+					s_doc.end_date = end_date
+					s_doc.deposit_date = deposit_date
+					s_doc.report_id = str(rep_id)
+					s_doc.report_document_id = str(rep_doc_id)
+					s_doc.raw_report_data = json.dumps(r, indent=2)
+					for ent in entries:
+						s_doc.append("entries", ent)
+					s_doc.insert(ignore_permissions=True)
+					processed_settlements.append(s_doc.name)
+
+			except Exception as e:
+				frappe.log_error(
+					title=f"Settlement Report Ingestion Failed: {rep_id}",
+					message=frappe.get_traceback(),
+				)
+
+		return processed_settlements
+
+	def reconcile_transactions_with_settlement(self, settlement_id: str) -> dict:
+		"""
+		Reconciles Amazon Financial Transactions against an Amazon Settlement.
+		Updates reconciliation_status on both records.
+		"""
+		s_name = frappe.db.get_value("Amazon Settlement", {"settlement_id": settlement_id}, "name")
+		if not s_name:
+			return {"matched": 0, "unmatched": 0}
+
+		s_doc = frappe.get_doc("Amazon Settlement", s_name)
+		matched_count = 0
+		unmatched_count = 0
+
+		for ent in s_doc.entries:
+			if ent.order_id:
+				tx_name = frappe.db.get_value("Amazon Financial Transaction", {"amazon_order_id": ent.order_id}, "name")
+				if tx_name:
+					ent.matched_financial_transaction = tx_name
+					ent.reconciliation_status = "Matched"
+					matched_count += 1
+					# Update transaction status
+					frappe.db.set_value("Amazon Financial Transaction", tx_name, {
+						"reconciliation_status": "Reconciled",
+						"settlement_id": settlement_id
+					})
+				else:
+					ent.reconciliation_status = "Unmatched"
+					unmatched_count += 1
+			else:
+				# Account level line (e.g. advertising, subscription, storage or transfer)
+				matched_tx = frappe.db.get_value(
+					"Amazon Financial Transaction",
+					{
+						"settlement_id": settlement_id,
+						"total_amount": ent.amount,
+					},
+					"name",
+				)
+				if matched_tx:
+					ent.matched_financial_transaction = matched_tx
+					ent.reconciliation_status = "Matched"
+					matched_count += 1
+					frappe.db.set_value("Amazon Financial Transaction", matched_tx, {
+						"reconciliation_status": "Reconciled",
+						"settlement_id": settlement_id,
+					})
+				elif ent.amount_type in ["FundTransfer", "Transfer"]:
+					ent.reconciliation_status = "Matched"
+					matched_count += 1
+				else:
+					ent.reconciliation_status = "Unmatched"
+					unmatched_count += 1
+
+
+		if matched_count > 0 and unmatched_count == 0:
+			s_doc.reconciliation_status = "Reconciled"
+		elif matched_count > 0:
+			s_doc.reconciliation_status = "Partially Reconciled"
+		else:
+			s_doc.reconciliation_status = "Unreconciled"
+
+		s_doc.save(ignore_permissions=True)
+		return {"matched": matched_count, "unmatched": unmatched_count}
+
+	def preview_amazon_transaction(self, transaction_name: str) -> dict:
+		"""
+		Phase 3 Accounting Preview:
+		Inspects an Amazon Financial Transaction, maps accounts, checks idempotency and GL balance.
+		MUST NOT create or commit any accounting entries.
+		"""
+		tx = frappe.get_doc("Amazon Financial Transaction", transaction_name)
+		acc_mapping = get_account_mapping(self.amz_setting.company)
+		warnings = []
+		errors = []
+
+		if not acc_mapping:
+			errors.append(f"No Amazon Account Mapping found for company '{self.amz_setting.company}'.")
+			return {
+				"transaction": tx.name,
+				"transaction_id": tx.amazon_transaction_id,
+				"transaction_type": tx.transaction_type,
+				"accounting_status": tx.accounting_status,
+				"amount": tx.total_amount,
+				"currency": tx.currency,
+				"errors": errors,
+				"warnings": warnings,
+				"is_postable": False,
+			}
+
+		# Idempotency check
+		if tx.accounting_status == "Posted" or tx.journal_entry:
+			warnings.append(f"Transaction is already posted. Linked Journal Entry: {tx.journal_entry}")
+
+		if tx.total_amount == 0.0:
+			errors.append("Transaction amount is 0.0, nothing to post.")
+
+		leaf_bds = [b for b in tx.breakdowns if b.allocation_scope == "Item"] or [b for b in tx.breakdowns if b.amount != 0]
+		if not leaf_bds:
+			errors.append("No valid breakdown rows found for transaction.")
+
+		lines = []
+		debit_accounts_preview = []
+		credit_accounts_preview = []
+
+		if tx.transaction_type in ["Transfer", "FundTransfer"]:
+			bank_acc = acc_mapping.bank_account
+			amt = abs(tx.total_amount)
+			lines.append({"account": bank_acc, "debit": amt, "credit": 0.0, "breakdown_type": "FundTransfer", "amount": amt})
+			lines.append({"account": acc_mapping.clearing_account, "debit": 0.0, "credit": amt, "breakdown_type": "Clearing", "amount": -amt})
+		else:
+			for b in leaf_bds:
+				acc, role = acc_mapping.get_account_for_breakdown(b.category, b.fee_type, b.breakdown_type)
+				if not acc:
+					errors.append(f"Breakdown '{b.breakdown_type}' (category: '{b.category}', fee_type: '{b.fee_type}') could not be mapped to an account.")
+					continue
+				amt = abs(b.amount)
+				if b.amount < 0:
+					dr = amt
+					cr = 0.0
+				else:
+					dr = 0.0
+					cr = amt
+
+				lines.append({"account": acc, "debit": dr, "credit": cr, "breakdown_type": b.breakdown_type, "amount": b.amount})
+				if dr > 0:
+					debit_accounts_preview.append(acc)
+				if cr > 0:
+					credit_accounts_preview.append(acc)
+
+			# Balancing clearing leg
+			tot_dr = sum(l["debit"] for l in lines)
+			tot_cr = sum(l["credit"] for l in lines)
+			clearing_diff = round(tot_cr - tot_dr, 2)
+			if clearing_diff > 0:
+				lines.append({"account": acc_mapping.clearing_account, "debit": clearing_diff, "credit": 0.0})
+				debit_accounts_preview.append(acc_mapping.clearing_account)
+			elif clearing_diff < 0:
+				lines.append({"account": acc_mapping.clearing_account, "debit": 0.0, "credit": abs(clearing_diff)})
+				credit_accounts_preview.append(acc_mapping.clearing_account)
+
+
+		# Aggregate lines by account to show net Dr / Cr
+		agg = {}
+		for l in lines:
+			acc = l["account"]
+			agg[acc] = agg.get(acc, {"dr": 0.0, "cr": 0.0})
+			agg[acc]["dr"] += l.get("debit", 0.0)
+			agg[acc]["cr"] += l.get("credit", 0.0)
+
+		net_debit_accounts = [acc for acc, vals in agg.items() if round(vals["dr"] - vals["cr"], 2) > 0]
+		net_credit_accounts = [acc for acc, vals in agg.items() if round(vals["cr"] - vals["dr"], 2) > 0]
+
+		final_tot_dr = sum(l["debit"] for l in lines)
+		final_tot_cr = sum(l["credit"] for l in lines)
+		if round(final_tot_dr, 2) != round(final_tot_cr, 2):
+			errors.append(f"Unbalanced proposed entry: Debit {final_tot_dr:.2f} != Credit {final_tot_cr:.2f}")
+
+		doc_type = "Bank Entry" if tx.transaction_type in ["Transfer", "FundTransfer"] else "Journal Entry"
+
+		return {
+			"transaction": tx.name,
+			"transaction_id": tx.amazon_transaction_id,
+			"transaction_type": tx.transaction_type,
+			"accounting_category": tx.accounting_category,
+			"amount": tx.total_amount,
+			"currency": tx.currency,
+			"posting_date": tx.posted_date.strftime("%Y-%m-%d") if tx.posted_date else frappe.utils.nowdate(),
+			"proposed_document_type": doc_type,
+			"proposed_lines": lines,
+			"debit_accounts": net_debit_accounts,
+			"credit_accounts": net_credit_accounts,
+			"existing_journal_entry": tx.journal_entry,
+			"sales_order": tx.sales_order,
+			"sales_invoice": tx.sales_invoice,
+			"accounting_status": tx.accounting_status,
+			"errors": errors,
+			"warnings": warnings,
+			"is_postable": len(errors) == 0 and tx.accounting_status != "Posted",
+		}
+
+	def post_amazon_transaction(self, transaction_name: str) -> str:
+		"""
+		Phase 3 Actual ERPNext Accounting Posting:
+		- Loads transaction and validates mapping & Ready status.
+		- Idempotent: If already posted, returns existing JE.
+		- Builds balanced Journal Entry (handles India Compliance GSTIN & Party).
+		- Submits JE via standard ERPNext document methods.
+		- Updates Amazon Financial Transaction with JE link, posting date, and 'Posted' status.
+		"""
+		tx = frappe.get_doc("Amazon Financial Transaction", transaction_name)
+
+		# 1. Idempotency Check
+		if tx.accounting_status == "Accounted":
+			return None
+
+		if tx.sales_invoice and frappe.db.get_value("Sales Invoice", tx.sales_invoice, "docstatus") == 1:
+			has_amz_tax = frappe.db.exists(
+				"Sales Taxes and Charges",
+				{"parent": tx.sales_invoice, "description": ["like", "Amazon %"]},
+			)
+			if has_amz_tax:
+				tx.accounting_status = "Accounted"
+				tx.save(ignore_permissions=True)
+				return None
+
+		if tx.journal_entry and frappe.db.exists("Journal Entry", tx.journal_entry):
+			je_docstatus = frappe.db.get_value("Journal Entry", tx.journal_entry, "docstatus")
+			if je_docstatus != 2:
+				return tx.journal_entry
+
+		# Check existing JE referencing this transaction
+		existing_je = frappe.db.get_value(
+			"Journal Entry",
+			{"user_remark": ["like", f"%{tx.amazon_transaction_id}%"], "docstatus": ["!=", 2]},
+			"name",
+		)
+		if existing_je:
+			tx.journal_entry = existing_je
+			tx.accounting_status = "Posted"
+			tx.save(ignore_permissions=True)
+			return existing_je
+
+		# 2. Preview and Validation
+		preview = self.preview_amazon_transaction(transaction_name)
+		if not preview.get("is_postable") and tx.accounting_status != "Posted":
+			err_msg = "; ".join(preview.get("errors") or ["Transaction not postable"])
+			tx.accounting_status = "Failed"
+			tx.accounting_error = err_msg[:500]
+			tx.save(ignore_permissions=True)
+			frappe.throw(_("Cannot post transaction {0}: {1}").format(transaction_name, err_msg))
+
+		acc_mapping = get_account_mapping(self.amz_setting.company)
+		company = self.amz_setting.company
+
+		# 3. Aggregate lines by account for clean Journal Entry
+		lines = preview["proposed_lines"]
+		agg = {}
+		for l in lines:
+			acc = l["account"]
+			agg[acc] = agg.get(acc, {"dr": 0.0, "cr": 0.0})
+			agg[acc]["dr"] += l.get("debit", 0.0)
+			agg[acc]["cr"] += l.get("credit", 0.0)
+
+		# Customer / Party resolution
+		party_customer = None
+		if tx.sales_invoice:
+			party_customer = frappe.db.get_value("Sales Invoice", tx.sales_invoice, "customer")
+		if not party_customer and tx.sales_order:
+			party_customer = frappe.db.get_value("Sales Order", tx.sales_order, "customer")
+		if not party_customer and acc_mapping.get("default_customer"):
+			party_customer = acc_mapping.default_customer
+		if not party_customer:
+			party_customer = frappe.db.get_value("Customer", {"customer_name": ["like", "%Amazon%"]}, "name")
+
+		je_accounts = []
+		for acc, vals in agg.items():
+			net = round(vals["dr"] - vals["cr"], 2)
+			if net == 0:
+				continue
+			acc_type = frappe.db.get_value("Account", acc, "account_type")
+			row = {
+				"account": acc,
+				"debit_in_account_currency": max(net, 0.0),
+				"credit_in_account_currency": max(-net, 0.0),
+			}
+			if acc_type in ["Receivable", "Payable"]:
+				if not party_customer:
+					frappe.throw(_("Party required for {0} but no Customer found.").format(acc))
+				row["party_type"] = "Customer"
+				row["party"] = party_customer
+			je_accounts.append(row)
+
+		# 4. Create and Submit Journal Entry
+		posting_date = preview["posting_date"]
+		is_bank_entry = preview["proposed_document_type"] == "Bank Entry"
+
+		je = frappe.new_doc("Journal Entry")
+		je.voucher_type = "Bank Entry" if is_bank_entry else "Journal Entry"
+		je.company = company
+		je.company_gstin = frappe.db.get_value("Company", company, "gstin")
+		je.posting_date = posting_date
+		je.user_remark = f"Amazon SP-API {tx.transaction_type} {tx.amazon_transaction_id}"
+
+		if is_bank_entry:
+			je.cheque_no = tx.amazon_transaction_id[:20]
+			je.cheque_date = posting_date
+
+		for ja in je_accounts:
+			je.append("accounts", ja)
+
+		try:
+			je.insert(ignore_permissions=True)
+			je.submit()
+		except Exception as e:
+			tx.accounting_status = "Failed"
+			tx.accounting_error = str(e)[:500]
+			tx.save(ignore_permissions=True)
+			raise
+
+		# 5. Link back and update transaction
+		tx.journal_entry = je.name
+		tx.posting_date = posting_date
+		tx.accounting_status = "Posted"
+		tx.accounting_error = None
+		tx.save(ignore_permissions=True)
+
+		return je.name
+
+	def post_amazon_transactions(self, posted_after: str | None = None, posted_before: str | None = None, limit: int = 50, tx_names: list[str] | None = None) -> dict:
+		"""
+		Controlled Batch Posting of READY Amazon Financial Transactions.
+		Isolates failures per transaction.
+		"""
+		if tx_names is None:
+			filters = {"accounting_status": "Ready", "docstatus": 0}
+			if posted_after:
+				filters["posted_date"] = [">=", posted_after]
+			if posted_before:
+				if "posted_date" in filters:
+					filters["posted_date"] = ["between", [posted_after, posted_before]]
+				else:
+					filters["posted_date"] = ["<=", posted_before]
+
+			tx_names = frappe.get_all(
+				"Amazon Financial Transaction",
+				filters=filters,
+				pluck="name",
+				limit=limit,
+				order_by="posted_date asc",
+			)
+		else:
+			tx_names = tx_names[:limit]
+
+		success = []
+		failed = []
+
+		for name in tx_names:
+			try:
+				je_name = self.post_amazon_transaction(name)
+				success.append({"transaction": name, "journal_entry": je_name})
+			except Exception as e:
+				failed.append({"transaction": name, "error": str(e)})
+
+		return {
+			"processed": len(tx_names),
+			"success_count": len(success),
+			"failed_count": len(failed),
+			"success": success,
+			"failed": failed,
+		}
+
+	def backfill_amazon_order_ids(self) -> dict:
+		"""
+		Safely and idempotently backfills and normalizes amazon_order_id across existing
+		Amazon Financial Transaction records using their stored raw_response.
+		Does NOT post accounting, modify journal entries, or create duplicates.
+		"""
+		records = frappe.get_all(
+			"Amazon Financial Transaction",
+			fields=["name", "amazon_order_id", "raw_response"],
+		)
+		updated = []
+		for r in records:
+			if not r.raw_response:
+				continue
+			try:
+				raw = json.loads(r.raw_response)
+			except Exception:
+				continue
+			extracted = extract_amazon_order_id(raw)
+			current = (r.amazon_order_id or "").strip() or None
+			if extracted and extracted != current:
+				frappe.db.set_value(
+					"Amazon Financial Transaction",
+					r.name,
+					"amazon_order_id",
+					extracted,
+					update_modified=False,
+				)
+				updated.append({"name": r.name, "old": current, "new": extracted})
+
+		if updated:
+			frappe.db.commit()
+
+		return {"total_checked": len(records), "updated_count": len(updated), "updated": updated}
+
+
+def backfill_amazon_order_ids(amz_setting_name: str | None = None) -> dict:
+	if not amz_setting_name:
+		amz_setting_name = frappe.db.get_value("Amazon SP API Settings", {}, "name")
+	ar = AmazonRepository(amz_setting_name)
+	return ar.backfill_amazon_order_ids()
+
+
+def preview_amazon_transaction(amz_setting_name: str, transaction_name: str) -> dict:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.preview_amazon_transaction(transaction_name)
+
+
+def post_amazon_transaction(amz_setting_name: str, transaction_name: str) -> str:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.post_amazon_transaction(transaction_name)
+
+
+def post_amazon_transactions(amz_setting_name: str, posted_after: str | None = None, posted_before: str | None = None, limit: int = 50) -> dict:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.post_amazon_transactions(posted_after=posted_after, posted_before=posted_before, limit=limit)
+
+
+
+def sync_financial_transactions(amz_setting_name: str, posted_after: str | None = None, posted_before: str | None = None) -> list[str]:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.sync_financial_transactions(posted_after=posted_after, posted_before=posted_before)
+
+
+def sync_settlement_reports(amz_setting_name: str, page_size: int = 5, created_since: str | None = None) -> list[str]:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.sync_settlement_reports(page_size=page_size, created_since=created_since)
+
 
 
 def validate_amazon_sp_api_credentials(**args) -> None:
@@ -2078,9 +3166,9 @@ def validate_amazon_sp_api_credentials(**args) -> None:
 		frappe.throw(msg)
 
 
-def get_orders(amz_setting_name, created_after=None, created_before=None, last_updated_after=None) -> list:
+def get_orders(amz_setting_name, created_after=None, created_before=None, last_updated_after=None, return_summary=False) -> list | dict:
 	ar = AmazonRepository(amz_setting_name)
-	return ar.get_orders(created_after=created_after, created_before=created_before, last_updated_after=last_updated_after)
+	return ar.get_orders(created_after=created_after, created_before=created_before, last_updated_after=last_updated_after, return_summary=return_summary)
 
 
 def create_sales_invoice(amz_setting_name: str, sales_order_name: str, order: dict | None = None, order_items: list | None = None) -> str:
